@@ -1,0 +1,14 @@
+# Build tuned for the Raspberry Pi Zero 2 W (Cortex-A53, ARMv8-A, NEON).
+#
+# IMPORTANT: scoped to the aarch64-unknown-linux-gnu target only.
+# Putting `-C target-cpu=cortex-a53` under a global [build] section would
+# apply it to host-side build scripts that cargo compiles for the host
+# architecture (target-lexicon's build.rs is the canonical example), and the
+# x86 LLVM backend will reject "cortex-a53" with an unhelpful error.
+#
+# Building natively on the Pi: this section still applies because the Pi's
+# host == aarch64 target. No change needed.
+# Cross-compiling from an x86 host: this section applies to the cross target,
+# host-side build scripts use default x86 settings. Correct behavior.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=cortex-a53"]

@@ -1,0 +1,76 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs of the same workflow on the same branch when a new
+# commit lands. Saves CI minutes on rapid push sequences.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Cache the cargo registry + target directory across runs.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        # The numpy/pyo3 trait import bugs we hit repeatedly during local
+        # development show up here, so this is the highest-value step.
+        run: cargo check --all-targets
+
+      - name: cargo clippy
+        # Treat warnings as failures EXCEPT for the unused_imports one we
+        # know about (PyArrayMethods isn't always used depending on which
+        # API surface we're touching). If clippy adds noise, narrow this.
+        run: cargo clippy --all-targets -- -D warnings -A unused_imports
+
+  python_smoke:
+    name: python build + import
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install maturin
+        run: pip install maturin
+
+      # x86 build on ubuntu-latest (no cross). This is just a smoke test to
+      # confirm the extension builds and imports; the actual release wheel
+      # is built by build.yml for aarch64.
+      - name: build extension
+        run: maturin develop --release
+
+      - name: smoke-import
+        run: |
+          python -c "
+          import inspect, star_detect
+          sig = inspect.signature(star_detect.detect_stars)
+          assert 'bg_mode' in sig.parameters
+          assert 'gate_mode' in sig.parameters
+          assert 'max_axis_ratio' in sig.parameters
+          print('OK:', star_detect.__file__)
+          print('sig:', sig)
+          "

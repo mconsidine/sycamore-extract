@@ -1,0 +1,26 @@
+[package]
+name = "star_detect"
+version = "0.6.2"
+edition = "2021"
+# This crate's 1-D and 2-D star "gate" logic is closely derived from CedarDetect
+# (https://github.com/smroid/cedar-detect) by Steven Rosenthal, which is licensed
+# under Apache-2.0. This crate is therefore an Apache-2.0 derivative work: keep the
+# LICENSE and attribution if you redistribute.
+license = "Apache-2.0"
+
+[lib]
+name = "star_detect"
+# cdylib => a Python-importable native extension (built by maturin).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pin these as a matched pair; PyO3's API changes across minor versions.
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

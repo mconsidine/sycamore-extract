@@ -1,0 +1,95 @@
+name: build
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    # Allow manual triggering with a custom tag for testing the workflow
+    # without cutting a real release.
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.6.2-test)"
+        required: true
+        default: "v0.0.0-dev"
+
+jobs:
+  build_aarch64:
+    name: build aarch64 wheel for py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # PyO3's official maturin action. Handles the cross-compile toolchain,
+      # the linker config, and produces a wheel as a build artifact.
+      # Target string matches what we've been building locally.
+      - name: build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+          # manylinux2014 is the broadest-compat option that still includes
+          # a modern enough glibc for ed25519/openssl/etc. Avoids the
+          # "manylinux_2_34" tag-rejection issue we hit locally — manylinux2014
+          # is universally accepted.
+          manylinux: "2014"
+          args: --release --interpreter python${{ matrix.python }}
+          rustup-components: rustfmt
+          before-script-linux: |
+            # Pin the Cortex-A53 tuning the same way our local .cargo/config.toml
+            # does. SCOPED to the aarch64 target only — putting it under [build]
+            # would apply it to host-side build scripts (which compile for x86)
+            # and break the build with "cortex-a53 is not a recognized processor
+            # for this target."
+            mkdir -p .cargo
+            cat > .cargo/config.toml <<'EOF'
+            [target.aarch64-unknown-linux-gnu]
+            rustflags = ["-C", "target-cpu=cortex-a53"]
+            EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}-aarch64
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  release:
+    name: attach wheels to release
+    needs: build_aarch64
+    runs-on: ubuntu-latest
+    # Only run on a real tag push, not on workflow_dispatch test runs.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: list wheels
+        run: ls -la dist/
+
+      - name: create release with wheels
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          body: |
+            ## Installation
+
+            On a Raspberry Pi running Pi OS Bookworm (aarch64, Python 3.13):
+
+            ```bash
+            pip install https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/star_detect-${{ github.ref_name }}-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+            ```
+
+            Substitute `cp311` or `cp312` for Python 3.11 or 3.12.
+
+            See `CHANGELOG.md` for what changed in this release.
+          generate_release_notes: true
+          draft: false
+          prerelease: false

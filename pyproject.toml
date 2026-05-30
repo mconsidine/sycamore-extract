@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "star_detect"
+description = "Fast star centroid extraction for plate solving on Raspberry Pi Zero 2 W class hardware"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Matt Considine" },
+]
+keywords = ["astronomy", "plate-solving", "star-detection", "finder", "raspberry-pi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+requires-python = ">=3.11"
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/mconsidine/sycamore-extract"
+Source = "https://github.com/mconsidine/sycamore-extract"
+Issues = "https://github.com/mconsidine/sycamore-extract/issues"
+Changelog = "https://github.com/mconsidine/sycamore-extract/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+strip = true

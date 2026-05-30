@@ -1,0 +1,24 @@
+sycamore-extract
+Copyright 2026 Matt Considine
+
+This product includes software developed by Steven Rosenthal as part of
+CedarDetect (https://github.com/smroid/cedar-detect), licensed under the
+Apache License, Version 2.0.
+
+The 1-D "cedar" gate algorithm in src/lib.rs (gate_1d_cedar) is closely
+derived from CedarDetect's gate_star_1d function. The 2-D gate, blob
+assembly, and overall pipeline structure also draw on CedarDetect's
+design. Changes include:
+
+  * Rust-native rewrite (CedarDetect is itself Rust; this is an
+    independent crate, not a fork).
+  * Bounded rayon thread pool with GIL release for Python integration.
+  * Background-cache state machine (examples/bg_cache.py) replacing
+    per-frame estimation for steady-state operation.
+  * Matched-filter gate alternative (gate_1d_mf) as an opt-in
+    complement to the cedar heuristic.
+  * Different centroiding approach (background-subtracted separable
+    projections with parabolic peak interpolation).
+  * Different noise and row-floor estimators.
+
+See ARCHITECTURE.md for a complete account of design differences.
