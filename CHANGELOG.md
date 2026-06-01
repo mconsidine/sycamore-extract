@@ -3,6 +3,25 @@
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-06-01
+
+### Changed
+- **`gate_mode` default changed from `"cedar"` to `"matched_filter"`** in both
+  `detect_stars` and `detect_stars_with_cache`. Callers that relied on the
+  implicit default will now use the matched filter; pass `gate_mode="cedar"`
+  explicitly to restore the previous behaviour.
+- `"default"` alias in `parse_gate_mode` remapped from Cedar → MatchedFilter to
+  stay consistent with the new default.
+- Version jump from 0.6.x to 0.8.0 avoids collision with 0.7.x tags on the
+  `matched-filter-only` branch.
+
+### Notes
+- Both gates remain present and fully supported; this is a default-only change.
+- Empirical sensitivity difference is unchanged: matched_filter at sigma=8
+  detects roughly the same star count as cedar at sigma=9-10. Callers
+  switching from cedar may want to lower sigma by 1-2 to maintain star count.
+  See `ARCHITECTURE.md` and tests/ab_gates.py for the calibration evidence.
+
 ## [0.6.2] — 2026-05-30
 
 ### Documentation

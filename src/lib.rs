@@ -101,16 +101,18 @@ struct Star {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateMode {
-    /// 7-pixel cedar-detect heuristic. The default.
+    /// 7-pixel cedar-detect heuristic (cedar-detect-derived, Apache-2.0).
     Cedar,
-    /// Matched filter with a Gaussian-shaped 7-tap kernel. Experimental.
+    /// Matched filter with a Gaussian-shaped 7-tap kernel. Default since v0.8.0.
     MatchedFilter,
 }
 
 fn parse_gate_mode(s: &str) -> PyResult<GateMode> {
     match s.to_ascii_lowercase().as_str() {
-        "cedar" | "default" | "heuristic" => Ok(GateMode::Cedar),
-        "matched_filter" | "matchedfilter" | "mf" | "matched" => Ok(GateMode::MatchedFilter),
+        "cedar" | "heuristic" => Ok(GateMode::Cedar),
+        "matched_filter" | "matchedfilter" | "mf" | "matched" | "default" => {
+            Ok(GateMode::MatchedFilter)
+        }
         other => Err(PyValueError::new_err(format!(
             "gate_mode must be 'cedar' or 'matched_filter', got '{other}'"
         ))),
@@ -1009,7 +1011,7 @@ fn set_num_threads(n: usize) -> PyResult<()> {
     use_neon=false,
     bg_mode="row_percentile",
     max_axis_ratio=f64::INFINITY,
-    gate_mode="cedar",
+    gate_mode="matched_filter",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars(
@@ -1134,7 +1136,7 @@ fn detect_stars(
     centroid_full_res=true,
     use_neon=false,
     max_axis_ratio=f64::INFINITY,
-    gate_mode="cedar",
+    gate_mode="matched_filter",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars_with_cache(
