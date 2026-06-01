@@ -3,6 +3,57 @@
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-05-31 — matched-filter-only branch
+
+### BREAKING
+- `gate_mode` parameter removed from `detect_stars` and
+  `detect_stars_with_cache`. Code calling `detect_stars(..., gate_mode="cedar")`
+  will fail with `TypeError: detect_stars() got an unexpected keyword argument
+  'gate_mode'`. Drop the argument.
+- The cedar-detect-derived heuristic gate algorithm has been removed entirely.
+  Only the matched filter remains.
+
+### Why
+This branch establishes sycamore-extract's algorithmic independence from
+cedar-detect. The matched filter is independently derived from classical
+signal-detection theory (North/Turin/Van Trees) and was implemented from
+that lineage, not from cedar source code. With the cedar-derived gate
+removed, no cedar source code is retained.
+
+Pipeline structure (prefilter → 1-D gate → blob assembly → 2-D gate →
+centroid) was informed by study of cedar-detect's architecture; that
+acknowledgment is preserved in NOTICE. See ARCHITECTURE.md for the design
+history that led here.
+
+### Practical impact
+- Detection on real-sky frames will be somewhat more conservative than v0.6.2
+  with `gate_mode="cedar"` (the previous default). On representative HQ
+  Camera frames at sigma=8, the matched filter detects roughly the same star
+  count as cedar at sigma=9-10. Users who want similar sensitivity to v0.6.2
+  defaults can lower sigma by 1-2.
+- The default sigma is unchanged at 8.0. This is the conventional astronomy
+  threshold; lowering the default would mask the real behavior change.
+  Document your sigma choice if you want reproducibility.
+
+### Removed
+- `tests/ab_gates.py` (compared the two gates; only one gate now).
+- `tests/inspect_disagreement.py` (visualized gate disagreements; same).
+- `tests/prototype_mf_bg.py` (dead-end exploration; documented in ARCHITECTURE.md).
+- `tests/spectral_diagnostic.py` (same; had known methodology issues).
+
+### Retained (and still useful)
+- `tests/bench.py` — single-extractor timing.
+- `tests/bench_pipeline.py` — sycamore vs olive-solve's extractor.
+- `tests/backend_speed_test.py` — end-to-end backend comparison.
+
+### Note
+- Versioned as 0.7.0 (not 1.0.0) to signal the breaking change in the API
+  without yet claiming validated field stability. 1.0.0 is reserved for
+  after under-the-sky validation confirms the matched-filter-only behavior
+  is good across real conditions (twilight, moon-near-FoV, star-rich
+  fields). Until then this branch is "ready for field testing" rather than
+  "stable for production."
+
 ## [0.6.2] — 2026-05-30
 
 ### Documentation

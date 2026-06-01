@@ -77,90 +77,17 @@ struct Star {
 }
 
 // =========================================================================
-// 1-D gate
+// 1-D gate: matched filter
 // =========================================================================
-// Two variants, selectable at the call site via GateMode:
 //
-//   Cedar: the original 7-pixel heuristic from cedar-detect (Apache-2.0).
-//     A pixel is a candidate if its value rises above local background by a
-//     sigma*noise margin AND is a local maximum within its 7-pixel neighborhood
-//     AND has a roughly uniform background on both sides. Branch-heavy,
-//     ordered for selectivity (cheapest, most-rejecting tests first). Battle-
-//     tested across years of real-sky frames in the PiFinder ecosystem.
+// Standard signal-detection construction. Convolve the 7-pixel window with a
+// discrete approximation of the expected stellar PSF (a Gaussian, sigma=1.5,
+// FWHM ~3.5 px tuned to representative HQ Camera + finder lens frames), and
+// accept pixels whose response exceeds a noise-scaled threshold. This is the
+// optimal linear detector for a known-shape pulse in additive Gaussian white
+// noise (North 1943, Turin 1960, Van Trees 1968).
 //
-//   MatchedFilter: standard signal-detection construction. Convolve the 7-pixel
-//     window with a discrete approximation of the expected stellar PSF (a tight
-//     Gaussian), and accept pixels whose response exceeds a threshold matched
-//     to maintain the same false-positive rate as the cedar gate. This is the
-//     optimal linear detector for a known-shape pulse in additive Gaussian
-//     noise (Van Trees, _Detection, Estimation, and Modulation Theory_, 1968;
-//     classical matched-filter result going back to North 1943 and Turin 1960).
-//     Implementation-wise: fewer branches, cleaner SIMD story, and the kernel
-//     coefficients are tunable for sensor-specific PSF. Performance on real
-//     finder frames is an open question; see tests/ab_gates.py.
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GateMode {
-    /// 7-pixel cedar-detect heuristic. The default.
-    Cedar,
-    /// Matched filter with a Gaussian-shaped 7-tap kernel. Experimental.
-    MatchedFilter,
-}
-
-fn parse_gate_mode(s: &str) -> PyResult<GateMode> {
-    match s.to_ascii_lowercase().as_str() {
-        "cedar" | "default" | "heuristic" => Ok(GateMode::Cedar),
-        "matched_filter" | "matchedfilter" | "mf" | "matched" => Ok(GateMode::MatchedFilter),
-        other => Err(PyValueError::new_err(format!(
-            "gate_mode must be 'cedar' or 'matched_filter', got '{other}'"
-        ))),
-    }
-}
-
-// Cedar gate: gate = [lb, lm, l, c, r, rm, rb]; returns true if center `c` is
-// a candidate.
-#[inline(always)]
-fn gate_1d_cedar(g: &[u8], sn2: i32, sn3: i32) -> bool {
-    let lb = g[0] as i32;
-    let rb = g[6] as i32;
-    let lm = g[1] as i32;
-    let l = g[2] as i32;
-    let c = g[3] as i32;
-    let r = g[4] as i32;
-    let rm = g[5] as i32;
-
-    if c + c - (lb + rb) < sn2 {
-        return false; // center not above local background by sigma*noise
-    }
-    if l > c || c < r {
-        return false; // not >= immediate neighbors
-    }
-    if lm >= c || c <= rm {
-        return false; // not strictly brighter than margins
-    }
-    if l == c && lm > r {
-        return false; // tie-break: left owns this candidate
-    }
-    if c == r && l <= rm {
-        return false; // tie-break: right owns this candidate
-    }
-    if (lb - rb).abs() > sn3 {
-        return false; // borders not ~uniform
-    }
-    true
-}
-
-// Matched filter response, integer arithmetic.
-//
-// Kernel: a Gaussian sampled at integer offsets sigma=1.5 (FWHM ~3.5 px),
-// scaled and mean-removed so DC (background) cancels exactly. The sigma=1.5
-// width was chosen to match the actual PSF FWHM seen on representative
-// Raspberry Pi HQ Camera + finder lens frames; a tighter kernel (sigma=1.0)
-// systematically rejected real, well-sampled stars whose energy extended
-// past the inner 3 pixels. See tests/inspect_disagreement.py for the
-// calibration procedure.
-//
-// Derivation (Python):
+// Kernel derivation (Python):
 //   raw    = exp(-x^2/(2*1.5^2)) for x in -3..3
 //          = [0.1353, 0.4111, 0.8007, 1.0, 0.8007, 0.4111, 0.1353]
 //   zm     = raw - mean(raw)              (mean-removed Gaussian)
@@ -168,39 +95,29 @@ fn gate_1d_cedar(g: &[u8], sn2: i32, sn3: i32) -> bool {
 //   k      = round(zm * scale), symmetrized
 //          = [-50, -15, 35, 60, 35, -15, -50]   sum = 0, symmetric
 //
-// k now sums to 0, so a uniform background contributes 0 to the response —
-// no separate background-subtraction step required. The response is the dot
+// k sums to 0, so a uniform background contributes 0 to the response — no
+// separate background-subtraction step required. The response is the dot
 // product <window, k>, an i32. For pure white noise of std `noise`, the
-// response has std `noise * ||k||_2`. We set the threshold so the false-
-// positive rate matches the cedar gate's "sigma*noise above local background"
-// criterion.
+// response has std `noise * ||k||_2`. Threshold is `sigma * noise * ||k||_2`.
 //
-// The kernel norm:
+// Kernel norm:
 //   sqrt(50^2 + 15^2 + 35^2 + 60^2 + 35^2 + 15^2 + 50^2)
-//   = sqrt(2500+225+1225+3600+1225+225+2500) = sqrt(11500) ~= 107.24
+//   = sqrt(11500) ~= 107.24
 //
-// Caller passes a precomputed threshold (`mf_thresh` = sigma * noise * 107).
-// Local-maximum test is kept (3-pixel) to avoid double-claiming adjacent
-// candidates from the same star — without it the matched filter spreads
-// detections over 2-3 pixels per star.
-//
-// EMPIRICAL NOTE: At the same nominal sigma value, this matched filter is
-// MORE CONSERVATIVE than the cedar gate. On real-sky HQ Camera frames, MF at
-// sigma=8 detects roughly the same star count as cedar at sigma=9-10. The
-// threshold derivation assumes Gaussian white noise in the response; real
-// frames have lower-frequency structure (residual background gradients,
-// sensor patterns) that adds variance to the matched-filter response
-// specifically. Cedar's local-max heuristic isn't sensitive to that
-// structure; matched filter is.
-//
-// This is not a bug — it's a different point in the detection-theory
-// tradeoff space. Users switching gate modes should expect to lower sigma
-// by 1-2 to maintain the same detected count. The matched filter's
-// advantage is a more principled false-positive rate on truly Gaussian
-// backgrounds; cedar's advantage is more permissive detection on real
-// frames with their characteristic structured noise.
+// Empirical behavior on real frames: the matched filter is somewhat
+// conservative — its threshold derivation assumes pure Gaussian noise, but
+// real-sky frames have correlated noise structure that adds variance to
+// the matched-filter response. Users on real-sky data may need to lower
+// sigma (typically by 1-2) below the conventional sigma=8 default to detect
+// faint stars near the noise floor. Field validation is encouraged before
+// committing to a specific default sigma for new sensor/optics combinations.
+// See ARCHITECTURE.md for the calibration history.
+
+// Local-maximum suppression: avoid double-claiming neighbors that are part
+// of the same star. Three-pixel local-max test with deterministic tie-breaks
+// so the same star always picks the same representative pixel.
 #[inline(always)]
-fn gate_1d_mf(g: &[u8], mf_thresh: i32) -> bool {
+fn gate_1d(g: &[u8], mf_thresh: i32) -> bool {
     let g0 = g[0] as i32;
     let g1 = g[1] as i32;
     let g2 = g[2] as i32;
@@ -214,14 +131,11 @@ fn gate_1d_mf(g: &[u8], mf_thresh: i32) -> bool {
     if response < mf_thresh {
         return false;
     }
-    // Local-maximum suppression: don't double-claim neighbors that are part of
-    // the same star. We approximate this via the raw pixel values, same as
-    // cedar — if `c` isn't the brightest of {l, c, r} we let the neighbor win.
+    // Local-maximum suppression in raw pixel space.
     if g2 > g3 || g3 < g4 {
         return false;
     }
-    // Tie-breaks identical to cedar's, for consistency when the two modes are
-    // compared on the same frame.
+    // Deterministic tie-breaks for flat-topped peaks.
     if g2 == g3 && g1 > g4 {
         return false;
     }
@@ -232,10 +146,10 @@ fn gate_1d_mf(g: &[u8], mf_thresh: i32) -> bool {
 }
 
 // Compute the matched-filter threshold from sigma/noise. Kept as a function
-// so the caller can compute once per band, not per pixel.
+// so the caller can compute it once per band, not per pixel.
 #[inline]
 fn mf_threshold(sigma: f64, noise: f64) -> i32 {
-    // Kernel L2 norm: ~107.24 (sigma=1.5 Gaussian, see gate_1d_mf derivation).
+    // Kernel L2 norm: ~107.24 (sigma=1.5 Gaussian, see gate_1d derivation).
     // We use 107 (slight conservative round) to avoid f64 math in the hot path.
     let t = sigma * noise * 107.0 + 0.5;
     t.clamp(1.0, i32::MAX as f64) as i32
@@ -355,9 +269,9 @@ fn compute_row_medians(data: &[u8], width: usize, height: usize) -> Vec<u8> {
 // `row_floors`, if Some, supplies a precomputed per-row background floor
 // (e.g. from LineMedian). If None, the in-loop 25th-percentile of cache-line
 // samples is used.
-// `gate_mode` selects between the cedar-detect heuristic gate and the
-// matched-filter alternative. `mf_thresh` is the precomputed threshold for
-// the matched filter (ignored when gate_mode is Cedar).
+// `sn2` (≈ sigma*noise) sets the cheap prefilter cutoff above the row floor
+// — every pixel above it gets the full matched-filter evaluation.
+// `mf_thresh` is the precomputed matched-filter response threshold.
 #[allow(clippy::too_many_arguments)]
 fn scan_band(
     data: &[u8],
@@ -365,10 +279,8 @@ fn scan_band(
     y0: usize,
     y1: usize,
     sn2: i32,
-    sn3: i32,
     use_neon: bool,
     row_floors: Option<&[u8]>,
-    gate_mode: GateMode,
     mf_thresh: i32,
 ) -> Vec<Candidate> {
     let half = (sn2 / 2).clamp(0, 255) as u8;
@@ -418,19 +330,18 @@ fn scan_band(
             threshold_scan_scalar(row, thresh, &mut hits);
         }
 
-        // For each pixel that cleared the prefilter, run the full 7-pixel gate.
+        // For each pixel that cleared the prefilter, run the matched-filter gate.
         for &x in &hits {
             let x = x as usize;
             if x < GATE_HALF || x + GATE_HALF >= width {
                 continue;
             }
             let g = &row[x - GATE_HALF..x + GATE_HALF + 1];
-            let pass = match gate_mode {
-                GateMode::Cedar => gate_1d_cedar(g, sn2, sn3),
-                GateMode::MatchedFilter => gate_1d_mf(g, mf_thresh),
-            };
-            if pass {
-                out.push(Candidate { x: x as u32, y: y as u32 });
+            if gate_1d(g, mf_thresh) {
+                out.push(Candidate {
+                    x: x as u32,
+                    y: y as u32,
+                });
             }
         }
     }
@@ -445,7 +356,9 @@ struct Dsu {
 }
 impl Dsu {
     fn new(n: usize) -> Self {
-        Dsu { parent: (0..n).collect() }
+        Dsu {
+            parent: (0..n).collect(),
+        }
     }
     fn find(&mut self, mut a: usize) -> usize {
         while self.parent[a] != a {
@@ -509,7 +422,14 @@ fn box_mean(data: &[u8], w: usize, x0: usize, y0: usize, bw: usize, bh: usize) -
 }
 
 // mean, min, max, stddev over the 1-pixel-thick border of a box.
-fn ring_stats(data: &[u8], w: usize, x0: usize, y0: usize, bw: usize, bh: usize) -> (f64, u8, u8, f64) {
+fn ring_stats(
+    data: &[u8],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    bw: usize,
+    bh: usize,
+) -> (f64, u8, u8, f64) {
     let mut sum = 0f64;
     let mut sumsq = 0f64;
     let mut n = 0f64;
@@ -631,8 +551,14 @@ fn gate_2d(
 
     // Background for centroiding: re-estimate on the centroid image perimeter
     // for sub-pixel correctness.
-    let (bg_cent, _, _, _) =
-        ring_stats(cent_img, cent_w, mx0.saturating_sub(1), my0.saturating_sub(1), mw + 2, mh + 2);
+    let (bg_cent, _, _, _) = ring_stats(
+        cent_img,
+        cent_w,
+        mx0.saturating_sub(1),
+        my0.saturating_sub(1),
+        mw + 2,
+        mh + 2,
+    );
 
     let mut hproj = vec![0f64; mw];
     let mut vproj = vec![0f64; mh];
@@ -694,7 +620,12 @@ fn gate_2d(
     let cx = mx0 as f64 + parabolic_peak(&hproj) + 0.5;
     let cy = my0 as f64 + parabolic_peak(&vproj) + 0.5;
 
-    Some(Star { x: cx, y: cy, brightness, peak })
+    Some(Star {
+        x: cx,
+        y: cy,
+        brightness,
+        peak,
+    })
 }
 
 // =========================================================================
@@ -808,8 +739,10 @@ fn bin2x2_mean(data: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
         let r1 = &data[(2 * by + 1) * w..(2 * by + 1) * w + w];
         let orow = &mut out[by * wb..by * wb + wb];
         for bx in 0..wb {
-            let s = r0[2 * bx] as u32 + r0[2 * bx + 1] as u32
-                  + r1[2 * bx] as u32 + r1[2 * bx + 1] as u32;
+            let s = r0[2 * bx] as u32
+                + r0[2 * bx + 1] as u32
+                + r1[2 * bx] as u32
+                + r1[2 * bx + 1] as u32;
             orow[bx] = ((s + 2) / 4) as u8;
         }
     }
@@ -833,13 +766,11 @@ fn detect(
     use_neon: bool,
     bg_mode: BgMode,
     max_axis_ratio: f64,
-    gate_mode: GateMode,
 ) -> Vec<Star> {
     if det_w < 7 || det_h < 7 {
         return Vec::new();
     }
     let sn2 = ((2.0 * sigma * noise + 0.5) as i32).max(2);
-    let sn3 = ((3.0 * sigma * noise + 0.5) as i32).max(3);
     let mf_thresh = mf_threshold(sigma, noise);
 
     // LineMedian: precompute one median per row in parallel. This is the
@@ -870,10 +801,8 @@ fn detect(
                     y0,
                     y1,
                     sn2,
-                    sn3,
                     use_neon,
                     row_floors.as_deref(),
-                    gate_mode,
                     mf_thresh,
                 )
             }
@@ -908,7 +837,11 @@ fn detect(
         })
         .collect();
 
-    stars.sort_by(|a, b| b.brightness.partial_cmp(&a.brightness).unwrap_or(Ordering::Equal));
+    stars.sort_by(|a, b| {
+        b.brightness
+            .partial_cmp(&a.brightness)
+            .unwrap_or(Ordering::Equal)
+    });
     stars
 }
 
@@ -972,6 +905,10 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 /// Args:
 ///   image: 2-D C-contiguous numpy uint8 array (height, width).
 ///   sigma: detection threshold in noise sigmas (typical 5-10; default 8).
+///          The matched filter is calibrated for sigma=8 on representative
+///          HQ Camera frames. On real-sky data with lots of correlated noise
+///          structure, you may need to lower sigma to 6-7 to catch faint
+///          stars near the noise floor. Field validation is encouraged.
 ///   noise: optional precomputed noise level; estimated if None.
 ///   bin:   1 (full res) or 2 (detect on a 2x2-binned image for speed). Centroids
 ///          are returned in full-resolution pixel coordinates regardless.
@@ -985,8 +922,7 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///          vignetting. LineMedian computes a true per-row median (via 256-bin
 ///          histogram, parallel across rows) and is more robust to per-row
 ///          offset noise, vertical brightness gradients, and twilight/light-
-///          pollution backgrounds. Equivalent to olive-solve's
-///          FastBgSubMode::LineMedian.
+///          pollution backgrounds.
 ///   max_axis_ratio: optional cap on detected blob elongation. A trail or
 ///          satellite streak has axis_ratio >> 1; an in-focus star is ~1.
 ///          Default Inf (no filtering). Recommend 3-5 for a finder.
@@ -1009,7 +945,6 @@ fn set_num_threads(n: usize) -> PyResult<()> {
     use_neon=false,
     bg_mode="row_percentile",
     max_axis_ratio=f64::INFINITY,
-    gate_mode="cedar",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars(
@@ -1022,7 +957,6 @@ fn detect_stars(
     use_neon: bool,
     bg_mode: &str,
     max_axis_ratio: f64,
-    gate_mode: &str,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -1039,54 +973,87 @@ fn detect_stars(
             )))
         }
     };
-    let gate = parse_gate_mode(gate_mode)?;
 
     // Copy the image into a Rust-owned buffer so we can drop the GIL.
     // ~0.7 MB on a 0.73 MP frame; ~1 ms memcpy on the Zero 2W. The win is that
     // every other Python thread can run during the multi-millisecond compute.
     let owned: Vec<u8> = image
         .as_slice()
-        .map_err(|_| PyValueError::new_err(
-            "image must be C-contiguous uint8; use np.ascontiguousarray",
-        ))?
+        .map_err(|_| {
+            PyValueError::new_err("image must be C-contiguous uint8; use np.ascontiguousarray")
+        })?
         .to_vec();
 
-    let stars = py.allow_threads(|| {
-        let pool = get_pool();
-        pool.install(|| match bin {
-            1 => {
-                let nz = noise.unwrap_or_else(|| estimate_noise(&owned, w, h));
-                Ok(detect(
-                    &owned, w, h, &owned, w, h, 1, sigma, nz, use_neon, bg, max_axis_ratio, gate,
-                ))
-            }
-            2 => {
-                let (b, wb, hb) = bin2x2_mean(&owned, w, h);
-                let nz = noise.unwrap_or_else(|| estimate_noise(&b, wb, hb));
-                let result = if centroid_full_res {
-                    detect(
-                        &b, wb, hb, &owned, w, h, 2, sigma, nz, use_neon, bg, max_axis_ratio, gate,
-                    )
-                } else {
-                    let in_binned = detect(
-                        &b, wb, hb, &b, wb, hb, 1, sigma, nz, use_neon, bg, max_axis_ratio, gate,
-                    );
-                    in_binned
-                        .into_iter()
-                        .map(|s| Star {
-                            x: s.x * 2.0,
-                            y: s.y * 2.0,
-                            brightness: s.brightness,
-                            peak: s.peak,
-                        })
-                        .collect()
-                };
-                Ok(result)
-            }
-            _ => Err("bin must be 1 or 2"),
+    let stars = py
+        .allow_threads(|| {
+            let pool = get_pool();
+            pool.install(|| match bin {
+                1 => {
+                    let nz = noise.unwrap_or_else(|| estimate_noise(&owned, w, h));
+                    Ok(detect(
+                        &owned,
+                        w,
+                        h,
+                        &owned,
+                        w,
+                        h,
+                        1,
+                        sigma,
+                        nz,
+                        use_neon,
+                        bg,
+                        max_axis_ratio,
+                    ))
+                }
+                2 => {
+                    let (b, wb, hb) = bin2x2_mean(&owned, w, h);
+                    let nz = noise.unwrap_or_else(|| estimate_noise(&b, wb, hb));
+                    let result = if centroid_full_res {
+                        detect(
+                            &b,
+                            wb,
+                            hb,
+                            &owned,
+                            w,
+                            h,
+                            2,
+                            sigma,
+                            nz,
+                            use_neon,
+                            bg,
+                            max_axis_ratio,
+                        )
+                    } else {
+                        let in_binned = detect(
+                            &b,
+                            wb,
+                            hb,
+                            &b,
+                            wb,
+                            hb,
+                            1,
+                            sigma,
+                            nz,
+                            use_neon,
+                            bg,
+                            max_axis_ratio,
+                        );
+                        in_binned
+                            .into_iter()
+                            .map(|s| Star {
+                                x: s.x * 2.0,
+                                y: s.y * 2.0,
+                                brightness: s.brightness,
+                                peak: s.peak,
+                            })
+                            .collect()
+                    };
+                    Ok(result)
+                }
+                _ => Err("bin must be 1 or 2"),
+            })
         })
-    })
-    .map_err(PyValueError::new_err)?;
+        .map_err(PyValueError::new_err)?;
 
     Ok(stars
         .into_iter()
@@ -1134,7 +1101,6 @@ fn detect_stars(
     centroid_full_res=true,
     use_neon=false,
     max_axis_ratio=f64::INFINITY,
-    gate_mode="cedar",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars_with_cache(
@@ -1147,14 +1113,12 @@ fn detect_stars_with_cache(
     centroid_full_res: bool,
     use_neon: bool,
     max_axis_ratio: f64,
-    gate_mode: &str,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
     if shape.len() != 2 {
         return Err(PyValueError::new_err("image must be 2-D"));
     }
-    let gate = parse_gate_mode(gate_mode)?;
 
     let expected_rows = match bin {
         1 => h,
@@ -1176,47 +1140,78 @@ fn detect_stars_with_cache(
     // Copy both inputs so we can drop the GIL.
     let owned: Vec<u8> = image
         .as_slice()
-        .map_err(|_| PyValueError::new_err(
-            "image must be C-contiguous uint8; use np.ascontiguousarray",
-        ))?
+        .map_err(|_| {
+            PyValueError::new_err("image must be C-contiguous uint8; use np.ascontiguousarray")
+        })?
         .to_vec();
     let owned_rof: Vec<u8> = rof_slice.to_vec();
 
-    let stars = py.allow_threads(|| {
-        let pool = get_pool();
-        pool.install(|| match bin {
-            1 => Ok(detect_cached(
-                &owned, w, h, &owned, w, h, 1, sigma, noise, use_neon,
-                &owned_rof, max_axis_ratio, gate,
-            )),
-            2 => {
-                let (b, wb, hb) = bin2x2_mean(&owned, w, h);
-                let result = if centroid_full_res {
-                    detect_cached(
-                        &b, wb, hb, &owned, w, h, 2, sigma, noise, use_neon,
-                        &owned_rof, max_axis_ratio, gate,
-                    )
-                } else {
-                    let in_binned = detect_cached(
-                        &b, wb, hb, &b, wb, hb, 1, sigma, noise, use_neon,
-                        &owned_rof, max_axis_ratio, gate,
-                    );
-                    in_binned
-                        .into_iter()
-                        .map(|s| Star {
-                            x: s.x * 2.0,
-                            y: s.y * 2.0,
-                            brightness: s.brightness,
-                            peak: s.peak,
-                        })
-                        .collect()
-                };
-                Ok(result)
-            }
-            _ => Err("bin must be 1 or 2"),
+    let stars = py
+        .allow_threads(|| {
+            let pool = get_pool();
+            pool.install(|| match bin {
+                1 => Ok(detect_cached(
+                    &owned,
+                    w,
+                    h,
+                    &owned,
+                    w,
+                    h,
+                    1,
+                    sigma,
+                    noise,
+                    use_neon,
+                    &owned_rof,
+                    max_axis_ratio,
+                )),
+                2 => {
+                    let (b, wb, hb) = bin2x2_mean(&owned, w, h);
+                    let result = if centroid_full_res {
+                        detect_cached(
+                            &b,
+                            wb,
+                            hb,
+                            &owned,
+                            w,
+                            h,
+                            2,
+                            sigma,
+                            noise,
+                            use_neon,
+                            &owned_rof,
+                            max_axis_ratio,
+                        )
+                    } else {
+                        let in_binned = detect_cached(
+                            &b,
+                            wb,
+                            hb,
+                            &b,
+                            wb,
+                            hb,
+                            1,
+                            sigma,
+                            noise,
+                            use_neon,
+                            &owned_rof,
+                            max_axis_ratio,
+                        );
+                        in_binned
+                            .into_iter()
+                            .map(|s| Star {
+                                x: s.x * 2.0,
+                                y: s.y * 2.0,
+                                brightness: s.brightness,
+                                peak: s.peak,
+                            })
+                            .collect()
+                    };
+                    Ok(result)
+                }
+                _ => Err("bin must be 1 or 2"),
+            })
         })
-    })
-    .map_err(PyValueError::new_err)?;
+        .map_err(PyValueError::new_err)?;
 
     Ok(stars
         .into_iter()
@@ -1240,13 +1235,11 @@ fn detect_cached(
     use_neon: bool,
     row_floors: &[u8],
     max_axis_ratio: f64,
-    gate_mode: GateMode,
 ) -> Vec<Star> {
     if det_w < 7 || det_h < 7 {
         return Vec::new();
     }
     let sn2 = ((2.0 * sigma * noise + 0.5) as i32).max(2);
-    let sn3 = ((3.0 * sigma * noise + 0.5) as i32).max(3);
     let mf_thresh = mf_threshold(sigma, noise);
 
     let n_bands = rayon::current_num_threads().max(1);
@@ -1260,8 +1253,14 @@ fn detect_cached(
                 Vec::new()
             } else {
                 scan_band(
-                    det_img, det_w, y0, y1, sn2, sn3, use_neon,
-                    Some(row_floors), gate_mode, mf_thresh,
+                    det_img,
+                    det_w,
+                    y0,
+                    y1,
+                    sn2,
+                    use_neon,
+                    Some(row_floors),
+                    mf_thresh,
                 )
             }
         })
@@ -1278,12 +1277,27 @@ fn detect_cached(
         .par_iter()
         .filter_map(|blob| {
             gate_2d(
-                &cands, blob, det_img, det_w, det_h, cent_img, cent_w, cent_h,
-                scale, noise, sigma, max_size, max_axis_ratio,
+                &cands,
+                blob,
+                det_img,
+                det_w,
+                det_h,
+                cent_img,
+                cent_w,
+                cent_h,
+                scale,
+                noise,
+                sigma,
+                max_size,
+                max_axis_ratio,
             )
         })
         .collect();
-    stars.sort_by(|a, b| b.brightness.partial_cmp(&a.brightness).unwrap_or(Ordering::Equal));
+    stars.sort_by(|a, b| {
+        b.brightness
+            .partial_cmp(&a.brightness)
+            .unwrap_or(Ordering::Equal)
+    });
     stars
 }
 

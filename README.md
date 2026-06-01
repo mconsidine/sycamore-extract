@@ -31,30 +31,39 @@ This is a **finder-only extractor**. It is not astrometry.
   consumes pre-computed state instead of re-estimating noise and row
   offsets every frame. See `ARCHITECTURE.md`.
 
-## Two gate algorithms, A/B comparable
+## 1-D gate: matched filter
 
 The 7-pixel "is this pixel a star candidate" gate is the heart of the
-detector. Two variants are implemented and selectable via `gate_mode`:
+detector. This branch uses a standard signal-detection construction: a
+discrete Gaussian kernel (sigma=1.5, calibrated against representative
+HQ Camera + finder lens frames) convolved against the 7-pixel window, with
+the response thresholded against `sigma * noise * ||k||_2`. Mathematically
+the optimal linear detector for a known PSF in additive Gaussian noise
+(North 1943, Turin 1960, Van Trees 1968).
 
-- **`cedar`** (default): the heuristic gate from
-  [cedar-detect](https://github.com/smroid/cedar-detect) by Steven Rosenthal.
-  Branch-ordered for selectivity, integer arithmetic, battle-tested on
-  thousands of real-sky frames in PiFinder.
-- **`matched_filter`**: a standard signal-detection construction — discrete
-  Gaussian kernel convolved against the 7-pixel window, threshold scaled to
-  match cedar's false-positive rate. Mathematically the optimal linear
-  detector for a known PSF in additive Gaussian noise.
+The matched filter is somewhat conservative on real-sky frames — its
+threshold derivation assumes Gaussian white noise, but real frames have
+correlated noise structure that the filter is sensitive to. If you're
+seeing fewer stars detected than expected, lower `sigma` by 1-2 from
+the conventional default. See `ARCHITECTURE.md` for the calibration
+history.
 
-Neither is *known* to be better than the other for this use case. The point
-is to make the comparison empirical. Run `tests/ab_gates.py` to compare them
-on your own frames.
+## About this branch
+
+This is the `matched-filter-only` branch (v0.7.x). The `main` branch
+(v0.6.x) ships a selectable two-gate design: cedar-detect-derived
+heuristic plus matched filter. This branch ships only the matched
+filter, with no cedar-derived code. See `CHANGELOG.md` and
+`ARCHITECTURE.md` for the rationale.
 
 ## Attribution
 
-The cedar-mode gate logic in `src/lib.rs` is derived from
-[cedar-detect](https://github.com/smroid/cedar-detect), Copyright Steven
-Rosenthal, Apache-2.0. See `NOTICE` for full attribution. This entire
-crate is Apache-2.0 licensed.
+This crate is Apache-2.0 licensed. The matched-filter detector was
+independently implemented from textbook signal-detection theory. The
+overall pipeline structure (prefilter → 1-D gate → blob assembly →
+2-D gate → centroid) was informed by study of cedar-detect; that
+influence is acknowledged in `NOTICE`. No cedar-detect source code is
+retained in this branch.
 
 ## Building
 
@@ -91,7 +100,6 @@ stars = star_detect.detect_stars(
     bin=2,                     # 1=full-res, 2=2x2-binned detection
     centroid_full_res=True,    # if bin=2, centroid on full-res image
     bg_mode="row_percentile",  # or "line_median"
-    gate_mode="cedar",         # or "matched_filter"
     max_axis_ratio=4.0,
     use_neon=False,
 )
@@ -100,7 +108,7 @@ stars = star_detect.detect_stars(
 # Cached detection (steady-state, background pre-computed elsewhere).
 stars = star_detect.detect_stars_with_cache(
     image_u8, row_offsets_u8, noise=2.5,
-    sigma=8.0, bin=2, gate_mode="cedar", max_axis_ratio=4.0,
+    sigma=8.0, bin=2, max_axis_ratio=4.0,
 )
 
 # Helper exposed for the background worker.
@@ -110,13 +118,10 @@ medians = star_detect.compute_row_medians_py(image_u8)
 ## Benchmarks
 
 - `tests/bench.py` — single-extractor timing across a directory of frames.
-- `tests/ab_gates.py` — A/B comparison of the cedar vs matched_filter gates.
 - `tests/bench_pipeline.py` — comparison against olive-solve's `FastExtractor`
   if installed.
-
-The A/B script's most useful columns are `cedar_only` and `mf_only` — stars
-each gate finds that the other doesn't. Diverging detections are where the
-algorithms genuinely disagree.
+- `tests/backend_speed_test.py` — end-to-end backend comparison
+  (extract + solve + LX200 formatting).
 
 ## Files
 

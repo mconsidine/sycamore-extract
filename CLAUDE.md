@@ -71,22 +71,24 @@ These were debated and chosen for reasons. Ask before reverting any of them.
    fast; olive-solve consumes them. Both link into the same Python process
    in the downstream diofinder app.
 
-7. **Two 1-D gate algorithms, A/B selectable.** `gate_mode="cedar"` (default)
-   is the cedar-detect heuristic; `gate_mode="matched_filter"` is the
-   standard signal-detection matched filter with a Gaussian-shaped kernel
-   (sigma=1.5, calibrated against HQ Camera typical PSF).
+7. **Single 1-D gate: matched filter.** Standard signal-detection
+   construction: convolve the 7-pixel window with a Gaussian-shaped kernel
+   (sigma=1.5, calibrated against HQ Camera typical PSF) and threshold the
+   response against `sigma * noise * ||k||_2`. Implementation is integer
+   arithmetic; mean-zero kernel cancels DC, so no per-pixel bg subtraction
+   is required.
 
-   **Empirically established**: matched_filter is *more conservative* than
-   cedar at the same nominal sigma. On representative HQ Camera frames, MF
-   at sigma=8 detects roughly the same star count as cedar at sigma=9-10.
-   This is structural — the threshold derivation assumes pure Gaussian
-   noise; real frames have correlated noise that perturbs the matched-
-   filter response more than cedar's local-max heuristic. See
-   tests/inspect_disagreement.py for the calibration evidence.
+   **Empirical behavior**: somewhat conservative on real-sky frames
+   because the threshold derivation assumes pure Gaussian noise but
+   real frames have correlated structure. Users on field data may need
+   to lower sigma by 1-2 from the conventional sigma=8 default to detect
+   faint stars near the noise floor. See ARCHITECTURE.md for the
+   calibration history that led to this design choice.
 
-   Neither is provably better for the finder use case. The presence of
-   both is deliberate: they let the comparison be empirical. Do not remove
-   either. See `tests/ab_gates.py`.
+   This branch contains *only* the matched filter. v0.6.x had a
+   selectable two-gate design (cedar-detect-derived heuristic + matched
+   filter) — that history is preserved on `main` for users who want it,
+   but this branch establishes algorithmic independence from cedar-detect.
 
 ## Things deliberately not done
 
@@ -131,7 +133,6 @@ stars = star_detect.detect_stars(
     bin=2,                     # 1=full-res, 2=2x2-binned detection
     centroid_full_res=True,    # if bin=2, centroid on full-res image
     bg_mode="row_percentile",  # or "line_median"
-    gate_mode="cedar",         # or "matched_filter" (experimental)
     max_axis_ratio=4.0,        # reject trails; default inf
     use_neon=False,            # explicit NEON prefilter (autovec is usually fine)
 )
@@ -144,7 +145,6 @@ stars = star_detect.detect_stars_with_cache(
     noise=2.5,                 # precomputed sigma
     sigma=8.0,
     bin=2,
-    gate_mode="cedar",         # same options as detect_stars
     max_axis_ratio=4.0,
 )
 
