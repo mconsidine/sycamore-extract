@@ -28,7 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: cargo fmt \
+          cargo fmt --all -- --check
 
       - name: cargo check
         # The numpy/pyo3 trait import bugs we hit repeatedly during local
