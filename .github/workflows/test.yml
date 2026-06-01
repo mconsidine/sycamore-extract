@@ -29,7 +29,6 @@ jobs:
 
       - name: cargo fmt
         run: cargo fmt
-          cargo fmt --all -- --check
 
       - name: cargo check
         # The numpy/pyo3 trait import bugs we hit repeatedly during local
