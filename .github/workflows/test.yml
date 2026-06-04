@@ -78,8 +78,9 @@ jobs:
           python -c "
           import inspect, star_detect
           sig = inspect.signature(star_detect.detect_stars)
-          assert 'gate_mode' in sig.parameters
+          assert 'bg_mode' in sig.parameters
           assert 'max_axis_ratio' in sig.parameters
+          assert 'gate_mode' not in sig.parameters
           print('OK:', star_detect.__file__)
           print('sig:', sig)
           "
