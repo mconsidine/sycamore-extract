@@ -63,6 +63,122 @@ pub enum BgMode {
     LineMedian,
 }
 
+// =========================================================================
+// Morphological white top-hat (separable, O(n) per row/column)
+// =========================================================================
+//
+// White top-hat = image − morphological_opening(image), where opening is
+// erosion followed by dilation with a flat (box) structuring element of
+// the given radius. The opening removes smooth low-frequency structure
+// (gradients, vignetting, sky-glow) while leaving high-frequency objects
+// (stars) intact. Detection then runs on the residual (near-zero flat
+// background with star peaks above it), and centroiding still uses the
+// original pixel values for sub-pixel accuracy.
+//
+// Algorithm: prefix/suffix running min/max within blocks of size w=2r+1
+// (van Herk / Gil-Werman). O(n) per 1-D pass, O(1) per pixel. Separable:
+// apply horizontally (morph_h), then vertically via transpose → morph_h →
+// transpose (morph_v). Four passes total per white-top-hat call.
+
+/// Sliding window minimum or maximum of a 1-D slice.
+/// Window size = 2*radius+1. Boundary elements use a reduced (clamped) window.
+/// O(n) via the van Herk / Gil-Werman prefix–suffix block trick with neutral
+/// padding so boundary windows work correctly without special-casing.
+fn extreme_1d(src: &[u8], radius: usize, is_max: bool) -> Vec<u8> {
+    let n = src.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let w = 2 * radius + 1;
+    let neutral = if is_max { 0u8 } else { 255u8 };
+
+    // Pad by `radius` neutral elements on each side so every window in the
+    // padded array is exactly w wide (no boundary asymmetry).
+    let pn = n + 2 * radius;
+    let mut padded = vec![neutral; pn];
+    padded[radius..radius + n].copy_from_slice(src);
+
+    // Prefix: left-to-right running extreme, reset at each block boundary.
+    let mut prefix = vec![neutral; pn];
+    for i in 0..pn {
+        prefix[i] = if i % w == 0 {
+            padded[i]
+        } else if is_max {
+            prefix[i - 1].max(padded[i])
+        } else {
+            prefix[i - 1].min(padded[i])
+        };
+    }
+
+    // Suffix: right-to-left running extreme, reset at each block boundary.
+    let mut suffix = vec![neutral; pn];
+    for i in (0..pn).rev() {
+        suffix[i] = if i % w == w - 1 || i == pn - 1 {
+            padded[i]
+        } else if is_max {
+            suffix[i + 1].max(padded[i])
+        } else {
+            suffix[i + 1].min(padded[i])
+        };
+    }
+
+    // Output: window [j, j+2r] in padded space maps to output[j] (original index j).
+    (0..n)
+        .map(|j| {
+            let lo = j;
+            let hi = j + 2 * radius;
+            if is_max {
+                suffix[lo].max(prefix[hi])
+            } else {
+                suffix[lo].min(prefix[hi])
+            }
+        })
+        .collect()
+}
+
+/// Apply extreme_1d along every row of a 2-D image (horizontal morphology pass).
+fn morph_h(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let row_in = &data[y * w..y * w + w];
+        row_out.copy_from_slice(&extreme_1d(row_in, radius, is_max));
+    });
+    out
+}
+
+/// Transpose a row-major 2-D image. Returns (transposed_data, new_w, new_h).
+fn transpose(data: &[u8], src_w: usize, src_h: usize) -> (Vec<u8>, usize, usize) {
+    let mut out = vec![0u8; src_w * src_h];
+    for y in 0..src_h {
+        for x in 0..src_w {
+            out[x * src_h + y] = data[y * src_w + x];
+        }
+    }
+    (out, src_h, src_w)
+}
+
+/// Apply extreme_1d along every column of a 2-D image (vertical morphology pass).
+/// Implemented as: transpose → morph_h → transpose back.
+fn morph_v(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<u8> {
+    let (t, tw, th) = transpose(data, w, h);
+    let r = morph_h(&t, tw, th, radius, is_max);
+    let (out, _, _) = transpose(&r, tw, th);
+    out
+}
+
+/// Morphological white top-hat transform: image − opening(image).
+/// `opening` = dilate(erode(image)) with a separable flat structuring element
+/// of the given radius. Removes broad low-frequency background (gradients,
+/// vignetting, sky-glow) while preserving point-source stars.
+fn white_tophat(data: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    let eroded = morph_v(&morph_h(data, w, h, radius, false), w, h, radius, false);
+    let opened = morph_v(&morph_h(&eroded, w, h, radius, true), w, h, radius, true);
+    data.iter()
+        .zip(opened.iter())
+        .map(|(&a, &b)| a.saturating_sub(b))
+        .collect()
+}
+
 #[derive(Copy, Clone)]
 struct Candidate {
     x: u32,
@@ -917,15 +1033,24 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///          precision that scaling-from-binned loses. No effect when bin=1.
 ///   use_neon: when true and built for aarch64, use the explicit NEON threshold
 ///          prefilter. No-op on non-aarch64 targets.
-///   bg_mode: "row_percentile" (default) or "line_median". RowPercentile is
-///          the cheapest mode and works well on dark-sky frames with mild
-///          vignetting. LineMedian computes a true per-row median (via 256-bin
-///          histogram, parallel across rows) and is more robust to per-row
-///          offset noise, vertical brightness gradients, and twilight/light-
-///          pollution backgrounds.
+///   bg_mode: "row_percentile" (default), "line_median", or "top_hat".
+///          RowPercentile is the cheapest mode and works well on dark-sky
+///          frames with mild vignetting. LineMedian computes a true per-row
+///          median (via 256-bin histogram, parallel across rows) and is more
+///          robust to per-row offset noise, vertical brightness gradients,
+///          and twilight/light-pollution backgrounds. TopHat applies a
+///          morphological white top-hat transform (image - opening) before
+///          detection to remove 2-D vignetting/sky-glow gradients; detection
+///          runs on the residual, centroids are taken on the original image.
+///          Requires tophat_radius > 0; if 0 is given with top_hat mode,
+///          defaults to radius 12.
 ///   max_axis_ratio: optional cap on detected blob elongation. A trail or
 ///          satellite streak has axis_ratio >> 1; an in-focus star is ~1.
 ///          Default Inf (no filtering). Recommend 3-5 for a finder.
+///   tophat_radius: structuring-element radius for the white top-hat (pixels,
+///          default 0 = disabled). Must exceed the largest star radius or the
+///          opening will consume star flux. Typical value: 12 (2× a well-
+///          focused star PSF). Only used when bg_mode="top_hat".
 ///
 /// Concurrency:
 ///   The image is copied into a Rust-owned buffer up front; the GIL is then
@@ -945,6 +1070,7 @@ fn set_num_threads(n: usize) -> PyResult<()> {
     use_neon=false,
     bg_mode="row_percentile",
     max_axis_ratio=f64::INFINITY,
+    tophat_radius=0u32,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars(
@@ -957,6 +1083,7 @@ fn detect_stars(
     use_neon: bool,
     bg_mode: &str,
     max_axis_ratio: f64,
+    tophat_radius: u32,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -964,12 +1091,22 @@ fn detect_stars(
         return Err(PyValueError::new_err("image must be 2-D"));
     }
 
-    let bg = match bg_mode.to_ascii_lowercase().as_str() {
-        "row_percentile" | "rowpercentile" | "percentile" | "default" => BgMode::RowPercentile,
-        "line_median" | "linemedian" | "row_median" => BgMode::LineMedian,
+    let (bg, tophat_r) = match bg_mode.to_ascii_lowercase().as_str() {
+        "row_percentile" | "rowpercentile" | "percentile" | "default" => {
+            (BgMode::RowPercentile, 0usize)
+        }
+        "line_median" | "linemedian" | "row_median" => (BgMode::LineMedian, 0usize),
+        "top_hat" | "tophat" | "white_tophat" => {
+            let r = if tophat_radius == 0 {
+                12
+            } else {
+                tophat_radius as usize
+            };
+            (BgMode::RowPercentile, r)
+        }
         other => {
             return Err(PyValueError::new_err(format!(
-                "bg_mode must be 'row_percentile' or 'line_median', got '{other}'"
+                "bg_mode must be 'row_percentile', 'line_median', or 'top_hat', got '{other}'"
             )))
         }
     };
@@ -989,9 +1126,15 @@ fn detect_stars(
             let pool = get_pool();
             pool.install(|| match bin {
                 1 => {
-                    let nz = noise.unwrap_or_else(|| estimate_noise(&owned, w, h));
+                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
+                        Some(white_tophat(&owned, w, h, tophat_r))
+                    } else {
+                        None
+                    };
+                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&owned);
+                    let nz = noise.unwrap_or_else(|| estimate_noise(det, w, h));
                     Ok(detect(
-                        &owned,
+                        det,
                         w,
                         h,
                         &owned,
@@ -1007,10 +1150,16 @@ fn detect_stars(
                 }
                 2 => {
                     let (b, wb, hb) = bin2x2_mean(&owned, w, h);
-                    let nz = noise.unwrap_or_else(|| estimate_noise(&b, wb, hb));
+                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
+                        Some(white_tophat(&b, wb, hb, tophat_r))
+                    } else {
+                        None
+                    };
+                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&b);
+                    let nz = noise.unwrap_or_else(|| estimate_noise(det, wb, hb));
                     let result = if centroid_full_res {
                         detect(
-                            &b,
+                            det,
                             wb,
                             hb,
                             &owned,
@@ -1025,7 +1174,7 @@ fn detect_stars(
                         )
                     } else {
                         let in_binned = detect(
-                            &b,
+                            det,
                             wb,
                             hb,
                             &b,
@@ -1083,6 +1232,10 @@ fn detect_stars(
 ///   bin:         1 or 2. With bin=2, row_offsets must be of length height/2
 ///                (one entry per row of the downsampled image).
 ///   centroid_full_res, use_neon, max_axis_ratio: same as detect_stars.
+///   tophat_radius: when > 0, apply white top-hat to the detection image
+///          before using the cached row_floors. The cached noise estimate is
+///          still used for thresholding. Centroids are taken on the original
+///          (pre-tophat) image. Default 0 (disabled).
 ///
 /// The caller is responsible for refreshing row_offsets and noise when the
 /// scene changes (slew, moon angle shift, twilight progression). If the
@@ -1101,6 +1254,7 @@ fn detect_stars(
     centroid_full_res=true,
     use_neon=false,
     max_axis_ratio=f64::INFINITY,
+    tophat_radius=0u32,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars_with_cache(
@@ -1113,6 +1267,7 @@ fn detect_stars_with_cache(
     centroid_full_res: bool,
     use_neon: bool,
     max_axis_ratio: f64,
+    tophat_radius: u32,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -1146,29 +1301,62 @@ fn detect_stars_with_cache(
         .to_vec();
     let owned_rof: Vec<u8> = rof_slice.to_vec();
 
+    let tophat_r = tophat_radius as usize;
+
     let stars = py
         .allow_threads(|| {
             let pool = get_pool();
             pool.install(|| match bin {
-                1 => Ok(detect_cached(
-                    &owned,
-                    w,
-                    h,
-                    &owned,
-                    w,
-                    h,
-                    1,
-                    sigma,
-                    noise,
-                    use_neon,
-                    &owned_rof,
-                    max_axis_ratio,
-                )),
+                1 => {
+                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
+                        Some(white_tophat(&owned, w, h, tophat_r))
+                    } else {
+                        None
+                    };
+                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&owned);
+                    // With tophat, the detection image background is ~0; use zero
+                    // row_floors so the threshold is sigma*noise (not inflated by
+                    // the cached original-space background level).
+                    let zero_floors: Vec<u8>;
+                    let floors: &[u8] = if tophat_r > 0 {
+                        zero_floors = vec![0u8; owned_rof.len()];
+                        &zero_floors
+                    } else {
+                        &owned_rof
+                    };
+                    Ok(detect_cached(
+                        det,
+                        w,
+                        h,
+                        &owned,
+                        w,
+                        h,
+                        1,
+                        sigma,
+                        noise,
+                        use_neon,
+                        floors,
+                        max_axis_ratio,
+                    ))
+                }
                 2 => {
                     let (b, wb, hb) = bin2x2_mean(&owned, w, h);
+                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
+                        Some(white_tophat(&b, wb, hb, tophat_r))
+                    } else {
+                        None
+                    };
+                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&b);
+                    let zero_floors: Vec<u8>;
+                    let floors: &[u8] = if tophat_r > 0 {
+                        zero_floors = vec![0u8; owned_rof.len()];
+                        &zero_floors
+                    } else {
+                        &owned_rof
+                    };
                     let result = if centroid_full_res {
                         detect_cached(
-                            &b,
+                            det,
                             wb,
                             hb,
                             &owned,
@@ -1178,12 +1366,12 @@ fn detect_stars_with_cache(
                             sigma,
                             noise,
                             use_neon,
-                            &owned_rof,
+                            floors,
                             max_axis_ratio,
                         )
                     } else {
                         let in_binned = detect_cached(
-                            &b,
+                            det,
                             wb,
                             hb,
                             &b,
@@ -1193,7 +1381,7 @@ fn detect_stars_with_cache(
                             sigma,
                             noise,
                             use_neon,
-                            &owned_rof,
+                            floors,
                             max_axis_ratio,
                         );
                         in_binned
