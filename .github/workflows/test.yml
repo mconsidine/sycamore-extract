@@ -80,7 +80,10 @@ jobs:
           sig = inspect.signature(star_detect.detect_stars)
           assert 'bg_mode' in sig.parameters
           assert 'max_axis_ratio' in sig.parameters
+          assert 'tophat_radius' in sig.parameters
           assert 'gate_mode' not in sig.parameters
+          sig2 = inspect.signature(star_detect.detect_stars_with_cache)
+          assert 'tophat_radius' in sig2.parameters
           print('OK:', star_detect.__file__)
           print('sig:', sig)
           "
