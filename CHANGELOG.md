@@ -21,6 +21,38 @@ versions follow [Semantic Versioning](https://semver.org/).
   detects roughly the same star count as cedar at sigma=9-10. Callers
   switching from cedar may want to lower sigma by 1-2 to maintain star count.
   See `ARCHITECTURE.md` and tests/ab_gates.py for the calibration evidence.
+## [0.7.0] — 2026-05-31 — matched-filter-only branch
+
+### Why
+This branch establishes sycamore-extract's algorithmic independence from
+cedar-detect. The matched filter is independently derived from classical
+signal-detection theory (North/Turin/Van Trees) and was implemented from
+that lineage, not from cedar source code. With the cedar-derived gate
+removed, no cedar source code is retained.
+
+### Practical impact
+- The default sigma is unchanged at 8.0. This is the conventional astronomy
+  threshold; lowering the default would mask the real behavior change.
+  Document your sigma choice if you want reproducibility.
+
+### Removed
+- `tests/ab_gates.py` (compared the two gates; only one gate now).
+- `tests/inspect_disagreement.py` (visualized gate disagreements; same).
+- `tests/prototype_mf_bg.py` (dead-end exploration; documented in ARCHITECTURE.md).
+- `tests/spectral_diagnostic.py` (same; had known methodology issues).
+
+### Retained (and still useful)
+- `tests/bench.py` — single-extractor timing.
+- `tests/bench_pipeline.py` — sycamore vs olive-solve's extractor.
+- `tests/backend_speed_test.py` — end-to-end backend comparison.
+
+### Note
+- Versioned as 0.7.0 (not 1.0.0) to signal the breaking change in the API
+  without yet claiming validated field stability. 1.0.0 is reserved for
+  after under-the-sky validation confirms the matched-filter-only behavior
+  is good across real conditions (twilight, moon-near-FoV, star-rich
+  fields). Until then this branch is "ready for field testing" rather than
+  "stable for production."
 
 ## [0.6.2] — 2026-05-30
 

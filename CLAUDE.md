@@ -88,6 +88,24 @@ These were debated and chosen for reasons. Ask before reverting any of them.
    Neither is provably better for the finder use case. The presence of
    both is deliberate: they let the comparison be empirical. Do not remove
    either. See `tests/ab_gates.py`.
+7. **Single 1-D gate: matched filter.** Standard signal-detection
+   construction: convolve the 7-pixel window with a Gaussian-shaped kernel
+   (sigma=1.5, calibrated against HQ Camera typical PSF) and threshold the
+   response against `sigma * noise * ||k||_2`. Implementation is integer
+   arithmetic; mean-zero kernel cancels DC, so no per-pixel bg subtraction
+   is required.
+
+   **Empirical behavior**: somewhat conservative on real-sky frames
+   because the threshold derivation assumes pure Gaussian noise but
+   real frames have correlated structure. Users on field data may need
+   to lower sigma by 1-2 from the conventional sigma=8 default to detect
+   faint stars near the noise floor. See ARCHITECTURE.md for the
+   calibration history that led to this design choice.
+
+   This branch contains *only* the matched filter. v0.6.x had a
+   selectable two-gate design (cedar-detect-derived heuristic + matched
+   filter) — that history is preserved on `main` for users who want it,
+   but this branch establishes algorithmic independence from cedar-detect.
 
 ## Things deliberately not done
 
@@ -129,14 +147,13 @@ star_detect.set_num_threads(2)
 
 # Standard per-frame detection.
 stars = star_detect.detect_stars(
-    image_u8,                   # 2-D C-contiguous numpy uint8 (H, W)
-    sigma=8.0,                  # threshold in noise sigmas
-    bin=2,                      # 1=full-res, 2=2x2-binned detection
-    centroid_full_res=True,     # if bin=2, centroid on full-res image
-    bg_mode="row_percentile",   # or "line_median"
-    gate_mode="matched_filter", # default since v0.8.0; or "cedar"
-    max_axis_ratio=4.0,         # reject trails; default inf
-    use_neon=False,             # explicit NEON prefilter (autovec is usually fine)
+    image_u8,                  # 2-D C-contiguous numpy uint8 (H, W)
+    sigma=8.0,                 # threshold in noise sigmas
+    bin=2,                     # 1=full-res, 2=2x2-binned detection
+    centroid_full_res=True,    # if bin=2, centroid on full-res image
+    bg_mode="row_percentile",  # or "line_median"
+    max_axis_ratio=4.0,        # reject trails; default inf
+    use_neon=False,            # explicit NEON prefilter (autovec is usually fine)
 )
 # -> [(x, y, brightness, peak), ...] brightest-first, (0.5, 0.5)=center of pixel (0,0)
 
@@ -147,7 +164,6 @@ stars = star_detect.detect_stars_with_cache(
     noise=2.5,                  # precomputed sigma
     sigma=8.0,
     bin=2,
-    gate_mode="matched_filter", # default since v0.8.0; or "cedar"
     max_axis_ratio=4.0,
 )
 

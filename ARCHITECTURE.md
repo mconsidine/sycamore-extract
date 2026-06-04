@@ -4,6 +4,33 @@ This is the long-form companion to `CLAUDE.md`. It records *why* each design
 decision was made and what alternatives were considered. If a future change
 proposal seems to relitigate one of these, read the relevant section first.
 
+## About this branch: matched-filter-only
+
+This `matched-filter-only` branch (v0.7.0+) ships only the matched-filter
+1-D gate. The cedar-detect-derived heuristic gate, which was selectable as
+an option in v0.6.x on `main`, has been removed entirely.
+
+The motivation is forward-looking risk management around cedar-detect's
+algorithmic lineage, rather than any technical shortcoming. The matched
+filter was independently derived from classical signal-detection theory
+(North/Turin/Van Trees) and contains no cedar source code. With the cedar
+heuristic gone, this branch establishes algorithmic independence.
+
+The pipeline structure (prefilter → 1-D gate → blob assembly → 2-D gate
+→ centroid) was informed by study of cedar-detect — that's true and worth
+acknowledging; see `NOTICE`. But pipeline architecture is not the same
+thing as source code lineage. This branch's *code* is independent.
+
+The history of why both gates existed, what was learned by comparing them,
+and what was tried to close the sensitivity gap is preserved below in the
+"Rejected alternatives" section. That work happened on `main` and informs
+why the matched filter is what it is today; deleting it from history would
+be dishonest about the design process.
+
+Practical consequence: detection is somewhat more conservative than v0.6.x
+with the cedar default. Users seeing fewer stars detected than expected
+should lower `sigma` by 1-2 from the conventional sigma=8 default.
+
 ## The two-call division (extractor + solver)
 
 The finder pipeline is split into two separate Python calls:
