@@ -112,6 +112,8 @@ These were debated and chosen for reasons. Ask before reverting any of them.
 - `scripts/build_cross.sh` — cross-build from x86 (default Python is 3.11;
   override with `PYVER=3.13` to match Pi OS Bookworm).
 - `tests/bench.py` — single-extractor timing harness.
+- `tests/ab_background.py` — A/B background compensation across bg_mode / bin /
+  gate / temporal cache on saved frames (counts, timing, centroid agreement).
 - `tests/bench_pipeline.py` — A/B against olive-solve's `FastExtractor`.
 - `examples/finder_loop.py` — control-flow sketch for the full finder.
 - `examples/bg_cache.py` — the background-cache state machine and worker.
