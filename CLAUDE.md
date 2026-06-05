@@ -109,9 +109,12 @@ These were debated and chosen for reasons. Ask before reverting any of them.
 
 ## Things deliberately not done
 
-- **No BlockMedian background.** LineMedian + the cached background worker
-  together cover the same ground at less per-frame cost. If you find a real
-  case the cache + LineMedian can't handle, propose BlockMedian then.
+- **BlockMedian is now `block_percentile`.** Added in v0.10.0 as
+  `bg_mode="block_percentile"` with `bg_block_size` (default 32 for bin=2
+  detection images). Uses bilinear interpolation of per-tile medians — same
+  algorithm as tetra3rs's `estimate_local_background`. Also added
+  `column_percentile` and `row_column_percentile` (separable 2-D removal) and
+  parallelised the `transpose` helper used by `white_tophat`.
 - **No full 2-D moment computation in `gate_2d`.** The current `max_axis_ratio`
   filter derives a coarse axis ratio from separable projections; it can't see
   diagonally-elongated trails as cleanly as olive-solve's eigendecomposition.
@@ -151,7 +154,8 @@ stars = star_detect.detect_stars(
     sigma=8.0,                 # threshold in noise sigmas
     bin=2,                     # 1=full-res, 2=2x2-binned detection
     centroid_full_res=True,    # if bin=2, centroid on full-res image
-    bg_mode="row_percentile",  # or "line_median"
+    bg_mode="row_percentile",  # "line_median", "top_hat", "column_percentile",
+                               # "row_column_percentile", "block_percentile"
     max_axis_ratio=4.0,        # reject trails; default inf
     use_neon=False,            # explicit NEON prefilter (autovec is usually fine)
 )

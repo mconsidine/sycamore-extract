@@ -147,13 +147,15 @@ fn morph_h(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<
 }
 
 /// Transpose a row-major 2-D image. Returns (transposed_data, new_w, new_h).
+/// Each output row (= one input column) is filled independently, so this is
+/// safe to parallelise without any synchronisation.
 fn transpose(data: &[u8], src_w: usize, src_h: usize) -> (Vec<u8>, usize, usize) {
     let mut out = vec![0u8; src_w * src_h];
-    for y in 0..src_h {
-        for x in 0..src_w {
-            out[x * src_h + y] = data[y * src_w + x];
+    out.par_chunks_mut(src_h).enumerate().for_each(|(x, col_out)| {
+        for y in 0..src_h {
+            col_out[y] = data[y * src_w + x];
         }
-    }
+    });
     (out, src_h, src_w)
 }
 
@@ -379,6 +381,127 @@ fn compute_row_medians(data: &[u8], width: usize, height: usize) -> Vec<u8> {
         }
     });
     out
+}
+
+/// Compute per-column median of a 2-D uint8 image. Returns a Vec<u8> of length `width`.
+fn compute_col_medians(data: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let (t, tw, th) = transpose(data, width, height);
+    compute_row_medians(&t, tw, th)
+}
+
+/// Subtract a per-row floor from every pixel (saturating). Returns a new image.
+fn subtract_row_floor(data: &[u8], width: usize, height: usize, floors: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; width * height];
+    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
+        let row_in = &data[y * width..y * width + width];
+        let f = floors[y];
+        for (o, &p) in row_out.iter_mut().zip(row_in.iter()) {
+            *o = p.saturating_sub(f);
+        }
+    });
+    out
+}
+
+/// Subtract a per-column floor from every pixel (saturating). Returns a new image.
+fn subtract_col_floor(data: &[u8], width: usize, height: usize, floors: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; width * height];
+    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
+        let row_in = &data[y * width..y * width + width];
+        for (x, (o, &p)) in row_out.iter_mut().zip(row_in.iter()).enumerate() {
+            *o = p.saturating_sub(floors[x]);
+        }
+    });
+    out
+}
+
+/// Bilinear block-median background subtraction.
+///
+/// Divides the image into `block_size × block_size` tiles. For each tile the
+/// median pixel value is computed. A smooth background surface is reconstructed
+/// via bilinear interpolation between tile centers and subtracted (saturating).
+/// Removes large-scale 2-D gradients (vignetting, sky-glow, light pollution)
+/// while preserving point sources.
+///
+/// `block_size` must comfortably exceed the largest expected star radius so no
+/// star flux is captured in the tile median. Typical values: 32 (bin=2), 64
+/// (bin=1). Parallelised: per-tile medians and per-row interpolation fan out.
+fn block_percentile_bg(data: &[u8], width: usize, height: usize, block_size: usize) -> Vec<u8> {
+    let bs = block_size.max(2);
+    let nx = width.div_ceil(bs);
+    let ny = height.div_ceil(bs);
+
+    let block_medians: Vec<u8> = (0..nx * ny)
+        .into_par_iter()
+        .map(|bi| {
+            let bx = bi % nx;
+            let by = bi / nx;
+            let x0 = bx * bs;
+            let y0 = by * bs;
+            let x1 = (x0 + bs).min(width);
+            let y1 = (y0 + bs).min(height);
+            let mut vals: Vec<u8> = Vec::with_capacity(bs * bs);
+            for y in y0..y1 {
+                vals.extend_from_slice(&data[y * width + x0..y * width + x1]);
+            }
+            vals.sort_unstable();
+            vals[vals.len() / 2]
+        })
+        .collect();
+
+    let half_bs = bs as f32 / 2.0;
+    let mut out = vec![0u8; width * height];
+    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
+        let row_in = &data[y * width..y * width + width];
+        let by_f = (y as f32 - half_bs) / bs as f32;
+        let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
+        let by1 = (by0 + 1).min(ny - 1);
+        let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
+        for (x, (o, &pixel)) in row_out.iter_mut().zip(row_in.iter()).enumerate() {
+            let bx_f = (x as f32 - half_bs) / bs as f32;
+            let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
+            let bx1 = (bx0 + 1).min(nx - 1);
+            let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
+            let m00 = block_medians[by0 * nx + bx0] as f32;
+            let m10 = block_medians[by0 * nx + bx1] as f32;
+            let m01 = block_medians[by1 * nx + bx0] as f32;
+            let m11 = block_medians[by1 * nx + bx1] as f32;
+            let bg = m00 * (1.0 - fx) * (1.0 - fy)
+                + m10 * fx * (1.0 - fy)
+                + m01 * (1.0 - fx) * fy
+                + m11 * fx * fy;
+            *o = pixel.saturating_sub(bg as u8);
+        }
+    });
+    out
+}
+
+/// Apply spatial background preprocessing, returning Some(corrected_image) or
+/// None if no preprocessing is needed.
+enum SpatialBg {
+    None,
+    TopHat(usize),
+    ColPercentile,
+    RowColPercentile,
+    BlockPercentile(usize),
+}
+
+fn apply_spatial_bg(img: &[u8], w: usize, h: usize, mode: &SpatialBg) -> Option<Vec<u8>> {
+    match mode {
+        SpatialBg::None => None,
+        SpatialBg::TopHat(r) => Some(white_tophat(img, w, h, *r)),
+        SpatialBg::ColPercentile => {
+            let cols = compute_col_medians(img, w, h);
+            Some(subtract_col_floor(img, w, h, &cols))
+        }
+        SpatialBg::RowColPercentile => {
+            // Row correction first (dominant CMOS readout artifact), then column.
+            let rows = compute_row_medians(img, w, h);
+            let row_corrected = subtract_row_floor(img, w, h, &rows);
+            let cols = compute_col_medians(&row_corrected, w, h);
+            Some(subtract_col_floor(&row_corrected, w, h, &cols))
+        }
+        SpatialBg::BlockPercentile(bs) => Some(block_percentile_bg(img, w, h, *bs)),
+    }
 }
 
 // Scan one band of rows [y0, y1) producing candidates in raster order.
@@ -1033,24 +1156,35 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///          precision that scaling-from-binned loses. No effect when bin=1.
 ///   use_neon: when true and built for aarch64, use the explicit NEON threshold
 ///          prefilter. No-op on non-aarch64 targets.
-///   bg_mode: "row_percentile" (default), "line_median", or "top_hat".
-///          RowPercentile is the cheapest mode and works well on dark-sky
-///          frames with mild vignetting. LineMedian computes a true per-row
-///          median (via 256-bin histogram, parallel across rows) and is more
-///          robust to per-row offset noise, vertical brightness gradients,
-///          and twilight/light-pollution backgrounds. TopHat applies a
-///          morphological white top-hat transform (image - opening) before
-///          detection to remove 2-D vignetting/sky-glow gradients; detection
-///          runs on the residual, centroids are taken on the original image.
-///          Requires tophat_radius > 0; if 0 is given with top_hat mode,
-///          defaults to radius 12.
+///   bg_mode: background subtraction strategy. Options:
+///     "row_percentile" (default) — cheapest; per-row 25th-percentile floor
+///       estimated inline per row. Works well on dark-sky frames with mild
+///       horizontal gradients.
+///     "line_median" — true per-row median (256-bin histogram, parallel);
+///       more robust to per-row offset noise and vertical gradients.
+///     "top_hat" — morphological white top-hat (image − opening) before
+///       detection; removes 2-D vignetting/sky-glow. Centroids are taken on
+///       the original image. Controlled by tophat_radius (default 12).
+///     "column_percentile" — subtracts per-column median before detection,
+///       removing vertical gradients (lens falloff, sky-glow top-to-bottom).
+///       Scan-band RowPercentile handles residual horizontal variation.
+///     "row_column_percentile" — row median subtraction followed by column
+///       median subtraction on the residual; separable 2-D background removal
+///       at ~2× the cost of line_median. Good all-round substitute for top_hat
+///       when the gradient is approximately separable.
+///     "block_percentile" — bilinear interpolation of per-tile medians;
+///       removes non-separable 2-D gradients (vignetting, nebulosity, light
+///       pollution) at a fraction of top_hat's cost. Tile size controlled by
+///       bg_block_size (default 32 at bin=2; scale up for bin=1).
 ///   max_axis_ratio: optional cap on detected blob elongation. A trail or
 ///          satellite streak has axis_ratio >> 1; an in-focus star is ~1.
 ///          Default Inf (no filtering). Recommend 3-5 for a finder.
 ///   tophat_radius: structuring-element radius for the white top-hat (pixels,
-///          default 0 = disabled). Must exceed the largest star radius or the
-///          opening will consume star flux. Typical value: 12 (2× a well-
-///          focused star PSF). Only used when bg_mode="top_hat".
+///          default 0 = use 12). Must exceed the largest star radius. Only
+///          used when bg_mode="top_hat".
+///   bg_block_size: tile side length in pixels for block_percentile mode
+///          (default 0 = use 32). Must comfortably exceed the largest star
+///          radius. Typical: 32 (bin=2 detection image), 64 (bin=1).
 ///
 /// Concurrency:
 ///   The image is copied into a Rust-owned buffer up front; the GIL is then
@@ -1071,6 +1205,7 @@ fn set_num_threads(n: usize) -> PyResult<()> {
     bg_mode="row_percentile",
     max_axis_ratio=f64::INFINITY,
     tophat_radius=0u32,
+    bg_block_size=0u32,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars(
@@ -1084,6 +1219,7 @@ fn detect_stars(
     bg_mode: &str,
     max_axis_ratio: f64,
     tophat_radius: u32,
+    bg_block_size: u32,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -1091,22 +1227,29 @@ fn detect_stars(
         return Err(PyValueError::new_err("image must be 2-D"));
     }
 
-    let (bg, tophat_r) = match bg_mode.to_ascii_lowercase().as_str() {
+    let (bg, spatial) = match bg_mode.to_ascii_lowercase().as_str() {
         "row_percentile" | "rowpercentile" | "percentile" | "default" => {
-            (BgMode::RowPercentile, 0usize)
+            (BgMode::RowPercentile, SpatialBg::None)
         }
-        "line_median" | "linemedian" | "row_median" => (BgMode::LineMedian, 0usize),
+        "line_median" | "linemedian" | "row_median" => (BgMode::LineMedian, SpatialBg::None),
         "top_hat" | "tophat" | "white_tophat" => {
-            let r = if tophat_radius == 0 {
-                12
-            } else {
-                tophat_radius as usize
-            };
-            (BgMode::RowPercentile, r)
+            let r = if tophat_radius == 0 { 12 } else { tophat_radius as usize };
+            (BgMode::RowPercentile, SpatialBg::TopHat(r))
+        }
+        "column_percentile" | "col_percentile" | "colpercentile" => {
+            (BgMode::RowPercentile, SpatialBg::ColPercentile)
+        }
+        "row_column_percentile" | "rowcolumnpercentile" | "row_col_percentile" => {
+            (BgMode::RowPercentile, SpatialBg::RowColPercentile)
+        }
+        "block_percentile" | "blockpercentile" | "block_median" => {
+            let bs = if bg_block_size == 0 { 32 } else { bg_block_size as usize };
+            (BgMode::RowPercentile, SpatialBg::BlockPercentile(bs))
         }
         other => {
             return Err(PyValueError::new_err(format!(
-                "bg_mode must be 'row_percentile', 'line_median', or 'top_hat', got '{other}'"
+                "bg_mode must be one of 'row_percentile', 'line_median', 'top_hat', \
+                 'column_percentile', 'row_column_percentile', 'block_percentile'; got '{other}'"
             )))
         }
     };
@@ -1126,75 +1269,22 @@ fn detect_stars(
             let pool = get_pool();
             pool.install(|| match bin {
                 1 => {
-                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
-                        Some(white_tophat(&owned, w, h, tophat_r))
-                    } else {
-                        None
-                    };
-                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&owned);
+                    let preproc = apply_spatial_bg(&owned, w, h, &spatial);
+                    let det: &[u8] = preproc.as_deref().unwrap_or(&owned);
                     let nz = noise.unwrap_or_else(|| estimate_noise(det, w, h));
-                    Ok(detect(
-                        det,
-                        w,
-                        h,
-                        &owned,
-                        w,
-                        h,
-                        1,
-                        sigma,
-                        nz,
-                        use_neon,
-                        bg,
-                        max_axis_ratio,
-                    ))
+                    Ok(detect(det, w, h, &owned, w, h, 1, sigma, nz, use_neon, bg, max_axis_ratio))
                 }
                 2 => {
                     let (b, wb, hb) = bin2x2_mean(&owned, w, h);
-                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
-                        Some(white_tophat(&b, wb, hb, tophat_r))
-                    } else {
-                        None
-                    };
-                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&b);
+                    let preproc = apply_spatial_bg(&b, wb, hb, &spatial);
+                    let det: &[u8] = preproc.as_deref().unwrap_or(&b);
                     let nz = noise.unwrap_or_else(|| estimate_noise(det, wb, hb));
                     let result = if centroid_full_res {
-                        detect(
-                            det,
-                            wb,
-                            hb,
-                            &owned,
-                            w,
-                            h,
-                            2,
-                            sigma,
-                            nz,
-                            use_neon,
-                            bg,
-                            max_axis_ratio,
-                        )
+                        detect(det, wb, hb, &owned, w, h, 2, sigma, nz, use_neon, bg, max_axis_ratio)
                     } else {
-                        let in_binned = detect(
-                            det,
-                            wb,
-                            hb,
-                            &b,
-                            wb,
-                            hb,
-                            1,
-                            sigma,
-                            nz,
-                            use_neon,
-                            bg,
-                            max_axis_ratio,
-                        );
-                        in_binned
+                        detect(det, wb, hb, &b, wb, hb, 1, sigma, nz, use_neon, bg, max_axis_ratio)
                             .into_iter()
-                            .map(|s| Star {
-                                x: s.x * 2.0,
-                                y: s.y * 2.0,
-                                brightness: s.brightness,
-                                peak: s.peak,
-                            })
+                            .map(|s| Star { x: s.x * 2.0, y: s.y * 2.0, ..s })
                             .collect()
                     };
                     Ok(result)
