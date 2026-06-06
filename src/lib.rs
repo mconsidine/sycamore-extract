@@ -483,6 +483,71 @@ enum SpatialBg {
     ColPercentile,
     RowColPercentile,
     BlockPercentile(usize),
+    UniformMean(usize),
+}
+
+/// 2-D sliding-window mean background subtraction via summed-area table.
+///
+/// Each pixel's background estimate is the mean of the `filter_size × filter_size`
+/// window centered on it (smaller windows at the boundary). Uses an integral
+/// image (SAT) so the per-pixel cost is O(1) regardless of window size, giving
+/// O(W×H) total. Equivalent to `scipy.ndimage.uniform_filter(image, filter_size)`
+/// followed by subtraction — reproduces the default tetra3 / olive-solve background.
+///
+/// `filter_size` must be odd and > 0 for a symmetric window; even values work
+/// but the center pixel falls one step off-center (same as scipy's behavior).
+fn uniform_mean_bg(data: &[u8], width: usize, height: usize, filter_size: usize) -> Vec<u8> {
+    let w = width;
+    let h = height;
+    let half = filter_size / 2;
+
+    // Build a summed-area table (SAT) with a 1-pixel border of zeros.
+    // sat[(y+1)*(w+1)+(x+1)] = sum of data[0..=y, 0..=x].
+    // Maximum value: 255 * 960 * 760 ≈ 185 M  — fits in u32.
+    let mut sat = vec![0u32; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut row_sum = 0u32;
+        for x in 0..w {
+            row_sum += data[y * w + x] as u32;
+            sat[(y + 1) * (w + 1) + (x + 1)] = row_sum + sat[y * (w + 1) + (x + 1)];
+        }
+    }
+
+    // Subtract per-pixel window mean (parallelised by row).
+    let mut out = vec![0u8; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+        let y0 = y.saturating_sub(half);
+        let y1 = (y + half + 1).min(h);
+        for (x, o) in row_out.iter_mut().enumerate() {
+            let x0 = x.saturating_sub(half);
+            let x1 = (x + half + 1).min(w);
+            let area = ((y1 - y0) * (x1 - x0)) as u32;
+            // SAT rectangle query: sum(y0..y1, x0..x1).
+            let sum = sat[y1 * (w + 1) + x1]
+                + sat[y0 * (w + 1) + x0]
+                - sat[y0 * (w + 1) + x1]
+                - sat[y1 * (w + 1) + x0];
+            let mean = (sum / area) as u8;
+            *o = data[y * w + x].saturating_sub(mean);
+        }
+    });
+    out
+}
+
+/// Global RMS noise estimator: sqrt(mean(pixel²)) over the entire image.
+///
+/// Used in place of the MAD-based `estimate_noise` when `noise_mode="global_rms"`.
+/// This matches olive-solve's `SigmaMode::GlobalRootSquare` and the original
+/// Python tetra3's default. It is faster than MAD but less robust — a bright
+/// nebula or strong gradient will inflate the estimate and raise the detection
+/// threshold, so it should only be used on already background-subtracted images.
+fn estimate_noise_global_rms(data: &[u8], w: usize, h: usize) -> f64 {
+    let n = (w * h) as u64;
+    if n == 0 {
+        return 0.5;
+    }
+    let sum_sq: u64 = data.iter().map(|&p| (p as u64) * (p as u64)).sum();
+    ((sum_sq as f64 / n as f64).sqrt()).max(0.5)
 }
 
 fn apply_spatial_bg(img: &[u8], w: usize, h: usize, mode: &SpatialBg) -> Option<Vec<u8>> {
@@ -501,6 +566,7 @@ fn apply_spatial_bg(img: &[u8], w: usize, h: usize, mode: &SpatialBg) -> Option<
             Some(subtract_col_floor(&row_corrected, w, h, &cols))
         }
         SpatialBg::BlockPercentile(bs) => Some(block_percentile_bg(img, w, h, *bs)),
+        SpatialBg::UniformMean(fs) => Some(uniform_mean_bg(img, w, h, *fs)),
     }
 }
 
@@ -1157,6 +1223,11 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///   use_neon: when true and built for aarch64, use the explicit NEON threshold
 ///          prefilter. No-op on non-aarch64 targets.
 ///   bg_mode: background subtraction strategy. Options:
+///     "uniform_mean" — 2-D sliding-window mean via summed-area table; O(1)
+///       per pixel regardless of window size. Reproduces the default tetra3 /
+///       olive-solve background (their filtsize=25). Window controlled by
+///       uniform_filter_size (default 25). Pair with noise_mode="global_rms"
+///       to exactly replicate the tetra3 pipeline.
 ///     "row_percentile" (default) — cheapest; per-row 25th-percentile floor
 ///       estimated inline per row. Works well on dark-sky frames with mild
 ///       horizontal gradients.
@@ -1185,6 +1256,17 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///   bg_block_size: tile side length in pixels for block_percentile mode
 ///          (default 0 = use 32). Must comfortably exceed the largest star
 ///          radius. Typical: 32 (bin=2 detection image), 64 (bin=1).
+///   uniform_filter_size: sliding-window side length for uniform_mean mode
+///          (default 0 = use 25, matching tetra3/olive-solve's filtsize=25).
+///          Must exceed the largest star PSF diameter.
+///   noise_mode: how to estimate the noise sigma when `noise` is not given.
+///          "mad" (default) — median absolute deviation on scattered patches;
+///            robust to gradients, stars, and hot pixels. Recommended for all
+///            modes except uniform_mean.
+///          "global_rms" — sqrt(mean(pixel²)) over the whole (preprocessed)
+///            image; matches olive-solve's GlobalRootSquare and the original
+///            Python tetra3 default. Faster but inflated by residual structure.
+///            Use with uniform_mean for an exact tetra3-compatible pipeline.
 ///
 /// Concurrency:
 ///   The image is copied into a Rust-owned buffer up front; the GIL is then
@@ -1206,6 +1288,8 @@ fn set_num_threads(n: usize) -> PyResult<()> {
     max_axis_ratio=f64::INFINITY,
     tophat_radius=0u32,
     bg_block_size=0u32,
+    uniform_filter_size=0u32,
+    noise_mode="mad",
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars(
@@ -1220,6 +1304,8 @@ fn detect_stars(
     max_axis_ratio: f64,
     tophat_radius: u32,
     bg_block_size: u32,
+    uniform_filter_size: u32,
+    noise_mode: &str,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -1246,13 +1332,23 @@ fn detect_stars(
             let bs = if bg_block_size == 0 { 32 } else { bg_block_size as usize };
             (BgMode::RowPercentile, SpatialBg::BlockPercentile(bs))
         }
+        "uniform_mean" | "uniformmean" | "local_mean" | "box_filter" => {
+            let fs = if uniform_filter_size == 0 { 25 } else { uniform_filter_size as usize };
+            (BgMode::RowPercentile, SpatialBg::UniformMean(fs))
+        }
         other => {
             return Err(PyValueError::new_err(format!(
                 "bg_mode must be one of 'row_percentile', 'line_median', 'top_hat', \
-                 'column_percentile', 'row_column_percentile', 'block_percentile'; got '{other}'"
+                 'column_percentile', 'row_column_percentile', 'block_percentile', \
+                 'uniform_mean'; got '{other}'"
             )))
         }
     };
+
+    let use_global_rms = matches!(
+        noise_mode.to_ascii_lowercase().as_str(),
+        "global_rms" | "globalrms" | "rms" | "root_square" | "global_root_square"
+    );
 
     // Copy the image into a Rust-owned buffer so we can drop the GIL.
     // ~0.7 MB on a 0.73 MP frame; ~1 ms memcpy on the Zero 2W. The win is that
@@ -1271,14 +1367,20 @@ fn detect_stars(
                 1 => {
                     let preproc = apply_spatial_bg(&owned, w, h, &spatial);
                     let det: &[u8] = preproc.as_deref().unwrap_or(&owned);
-                    let nz = noise.unwrap_or_else(|| estimate_noise(det, w, h));
+                    let nz = noise.unwrap_or_else(|| {
+                        if use_global_rms { estimate_noise_global_rms(det, w, h) }
+                        else { estimate_noise(det, w, h) }
+                    });
                     Ok(detect(det, w, h, &owned, w, h, 1, sigma, nz, use_neon, bg, max_axis_ratio))
                 }
                 2 => {
                     let (b, wb, hb) = bin2x2_mean(&owned, w, h);
                     let preproc = apply_spatial_bg(&b, wb, hb, &spatial);
                     let det: &[u8] = preproc.as_deref().unwrap_or(&b);
-                    let nz = noise.unwrap_or_else(|| estimate_noise(det, wb, hb));
+                    let nz = noise.unwrap_or_else(|| {
+                        if use_global_rms { estimate_noise_global_rms(det, wb, hb) }
+                        else { estimate_noise(det, wb, hb) }
+                    });
                     let result = if centroid_full_res {
                         detect(det, wb, hb, &owned, w, h, 2, sigma, nz, use_neon, bg, max_axis_ratio)
                     } else {
