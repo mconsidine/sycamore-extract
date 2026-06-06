@@ -109,6 +109,11 @@ These were debated and chosen for reasons. Ask before reverting any of them.
 
 ## Things deliberately not done
 
+- **`uniform_mean` + `noise_mode="global_rms"` added in v0.11.0.** This is the
+  exact tetra3 / olive-solve default pipeline: 2-D sliding-window mean background
+  (summed-area table, O(1) per pixel) + global RMS noise estimate. Use
+  `uniform_filter_size` (default 25) and `noise_mode="global_rms"`. The SAT
+  building step is serial O(N) but fast; subtraction is parallelised by row.
 - **BlockMedian is now `block_percentile`.** Added in v0.10.0 as
   `bg_mode="block_percentile"` with `bg_block_size` (default 32 for bin=2
   detection images). Uses bilinear interpolation of per-tile medians — same
@@ -155,7 +160,8 @@ stars = star_detect.detect_stars(
     bin=2,                     # 1=full-res, 2=2x2-binned detection
     centroid_full_res=True,    # if bin=2, centroid on full-res image
     bg_mode="row_percentile",  # "line_median", "top_hat", "column_percentile",
-                               # "row_column_percentile", "block_percentile"
+                               # "row_column_percentile", "block_percentile",
+                               # "uniform_mean"
     max_axis_ratio=4.0,        # reject trails; default inf
     use_neon=False,            # explicit NEON prefilter (autovec is usually fine)
 )
