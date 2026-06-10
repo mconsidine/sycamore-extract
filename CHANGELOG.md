@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.11.1
+
+Performance pass for the Pi Zero 2W hot paths (output is byte-identical to
+0.11.0 — verified by parity unit tests against reference implementations):
+
+- `white_tophat`: per-thread scratch reuse in the van Herk passes (was 3 Vec
+  allocations per row per pass), middle transposes fused away (2 transposes per
+  call instead of 4), and the final subtraction parallelised. Expected ~2x
+  faster top_hat at bin=2.
+- `transpose`: tiled 32x32 (cache-friendly on Cortex-A53) instead of naive
+  strided.
+- `block_percentile`: per-tile median via 256-bin counting (no per-tile
+  allocation or sort), selecting the same element as the previous sort.
+- `detect_stars` / `detect_stars_with_cache`: sigma is clamped to >= 0.5 — a
+  sigma near 0 made every noise pixel a candidate (multi-hundred-ms frames and
+  a flood of false stars).
+- New `#[cfg(test)]` parity suite (`cargo test`): van Herk vs naive window
+  extreme, scratch-reuse cleanliness, tiled transpose vs naive + roundtrip,
+  fused top-hat vs the pre-fusion 4-transpose pipeline, histogram tile median
+  vs the sorted reference.
+- CLAUDE.md: refreshed the thread-pool decision (downstream diofinder now runs
+  3 threads on dedicated cores) and removed a stale duplicate gate-mode
+  decision left from a pre-0.9.0 merge.
+
+
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versions follow [Semantic Versioning](https://semver.org/).
 

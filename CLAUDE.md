@@ -40,10 +40,11 @@ These were debated and chosen for reasons. Ask before reverting any of them.
 
 1. **Bounded thread pool, not unlimited rayon.** Default 2 threads (configurable
    via `STAR_DETECT_THREADS` env var or `star_detect.set_num_threads(n)`).
-   On a 4-core Pi running camera + IMU + SkySafari + web + solver, claiming all
-   4 cores during detection causes UX jitter. The 2-thread cap trades ~50%
-   per-frame speed for keeping other workers responsive. Wall-clock detection
-   is still fast (5–10 ms p50 at 0.73 MP).
+   The cap exists so a detection burst can't starve other workers on a shared
+   box. NOTE: the downstream diofinder daemon now pins its solver process to
+   three dedicated cores (CPUs 1-3, with comms/webui on CPU 0) and calls
+   `set_num_threads(3)` — on that deployment the 2-thread rationale no longer
+   applies and 3 is correct. The library default stays 2 for unknown callers.
 
 2. **GIL is released during detection.** The image is copied (~1 ms for 0.73
    MP) before `py.allow_threads(|| ...)`. This lets the SkySafari handler,
@@ -71,23 +72,6 @@ These were debated and chosen for reasons. Ask before reverting any of them.
    fast; olive-solve consumes them. Both link into the same Python process
    in the downstream diofinder app.
 
-7. **Two 1-D gate algorithms, A/B selectable.** `gate_mode="matched_filter"`
-   (default since v0.8.0) is the standard signal-detection matched filter with
-   a Gaussian-shaped kernel (sigma=1.5, calibrated against HQ Camera typical
-   PSF). `gate_mode="cedar"` is the older cedar-detect heuristic; pass it
-   explicitly to use the pre-v0.8.0 behaviour.
-
-   **Empirically established**: matched_filter is *more conservative* than
-   cedar at the same nominal sigma. On representative HQ Camera frames, MF
-   at sigma=8 detects roughly the same star count as cedar at sigma=9-10.
-   This is structural — the threshold derivation assumes pure Gaussian
-   noise; real frames have correlated noise that perturbs the matched-
-   filter response more than cedar's local-max heuristic. See
-   tests/inspect_disagreement.py for the calibration evidence.
-
-   Neither is provably better for the finder use case. The presence of
-   both is deliberate: they let the comparison be empirical. Do not remove
-   either. See `tests/ab_gates.py`.
 7. **Single 1-D gate: matched filter.** Standard signal-detection
    construction: convolve the 7-pixel window with a Gaussian-shaped kernel
    (sigma=1.5, calibrated against HQ Camera typical PSF) and threshold the
@@ -102,10 +86,9 @@ These were debated and chosen for reasons. Ask before reverting any of them.
    faint stars near the noise floor. See ARCHITECTURE.md for the
    calibration history that led to this design choice.
 
-   This branch contains *only* the matched filter. v0.6.x had a
-   selectable two-gate design (cedar-detect-derived heuristic + matched
-   filter) — that history is preserved on `main` for users who want it,
-   but this branch establishes algorithmic independence from cedar-detect.
+   Since v0.9.0 the crate contains *only* the matched filter — the
+   `gate_mode` parameter was removed (passing it raises TypeError).
+   The v0.6.x two-gate history lives in git history if ever needed.
 
 ## Things deliberately not done
 

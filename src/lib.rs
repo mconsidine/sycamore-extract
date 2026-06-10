@@ -84,22 +84,36 @@ pub enum BgMode {
 /// Window size = 2*radius+1. Boundary elements use a reduced (clamped) window.
 /// O(n) via the van Herk / Gil-Werman prefix–suffix block trick with neutral
 /// padding so boundary windows work correctly without special-casing.
-fn extreme_1d(src: &[u8], radius: usize, is_max: bool) -> Vec<u8> {
+fn extreme_1d_into(
+    src: &[u8],
+    radius: usize,
+    is_max: bool,
+    s: &mut MorphScratch,
+    out: &mut [u8],
+) {
     let n = src.len();
     if n == 0 {
-        return Vec::new();
+        return;
     }
     let w = 2 * radius + 1;
     let neutral = if is_max { 0u8 } else { 255u8 };
-
-    // Pad by `radius` neutral elements on each side so every window in the
-    // padded array is exactly w wide (no boundary asymmetry).
     let pn = n + 2 * radius;
-    let mut padded = vec![neutral; pn];
+
+    // Reuse caller-owned scratch: grow once per thread, then only the small
+    // pad regions are re-filled per row. The prefix/suffix buffers are fully
+    // overwritten below, so they need no clearing at all.
+    if s.padded.len() < pn {
+        s.padded.resize(pn, 0);
+        s.prefix.resize(pn, 0);
+        s.suffix.resize(pn, 0);
+    }
+    let padded = &mut s.padded[..pn];
+    padded[..radius].fill(neutral);
     padded[radius..radius + n].copy_from_slice(src);
+    padded[radius + n..].fill(neutral);
 
     // Prefix: left-to-right running extreme, reset at each block boundary.
-    let mut prefix = vec![neutral; pn];
+    let prefix = &mut s.prefix[..pn];
     for i in 0..pn {
         prefix[i] = if i % w == 0 {
             padded[i]
@@ -111,7 +125,7 @@ fn extreme_1d(src: &[u8], radius: usize, is_max: bool) -> Vec<u8> {
     }
 
     // Suffix: right-to-left running extreme, reset at each block boundary.
-    let mut suffix = vec![neutral; pn];
+    let suffix = &mut s.suffix[..pn];
     for i in (0..pn).rev() {
         suffix[i] = if i % w == w - 1 || i == pn - 1 {
             padded[i]
@@ -122,27 +136,35 @@ fn extreme_1d(src: &[u8], radius: usize, is_max: bool) -> Vec<u8> {
         };
     }
 
-    // Output: window [j, j+2r] in padded space maps to output[j] (original index j).
-    (0..n)
-        .map(|j| {
-            let lo = j;
-            let hi = j + 2 * radius;
-            if is_max {
-                suffix[lo].max(prefix[hi])
-            } else {
-                suffix[lo].min(prefix[hi])
-            }
-        })
-        .collect()
+    // Output: window [j, j+2r] in padded space maps to output[j].
+    for (j, o) in out.iter_mut().enumerate() {
+        *o = if is_max {
+            suffix[j].max(prefix[j + 2 * radius])
+        } else {
+            suffix[j].min(prefix[j + 2 * radius])
+        };
+    }
+}
+
+/// Per-thread scratch for the van Herk passes. One set of buffers per rayon
+/// worker (via for_each_init) instead of three fresh Vecs per row — the
+/// allocation churn was the dominant constant factor in white_tophat.
+#[derive(Default)]
+struct MorphScratch {
+    padded: Vec<u8>,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
 }
 
 /// Apply extreme_1d along every row of a 2-D image (horizontal morphology pass).
 fn morph_h(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
-    out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
-        let row_in = &data[y * w..y * w + w];
-        row_out.copy_from_slice(&extreme_1d(row_in, radius, is_max));
-    });
+    out.par_chunks_mut(w).enumerate().for_each_init(
+        MorphScratch::default,
+        |scratch, (y, row_out)| {
+            extreme_1d_into(&data[y * w..y * w + w], radius, is_max, scratch, row_out);
+        },
+    );
     out
 }
 
@@ -150,22 +172,29 @@ fn morph_h(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<
 /// Each output row (= one input column) is filled independently, so this is
 /// safe to parallelise without any synchronisation.
 fn transpose(data: &[u8], src_w: usize, src_h: usize) -> (Vec<u8>, usize, usize) {
+    // Tiled (32x32) so both the source and destination lines of a tile stay
+    // resident in L1; the naive strided version walked the whole source image
+    // once per output row and was memory-latency bound on the A53.
+    const TILE: usize = 32;
     let mut out = vec![0u8; src_w * src_h];
-    out.par_chunks_mut(src_h).enumerate().for_each(|(x, col_out)| {
-        for y in 0..src_h {
-            col_out[y] = data[y * src_w + x];
-        }
-    });
+    // Output is src_w rows of length src_h; one strip = TILE output rows
+    // (= TILE source columns), filled independently per rayon job.
+    out.par_chunks_mut(TILE * src_h)
+        .enumerate()
+        .for_each(|(strip, chunk)| {
+            let x0 = strip * TILE;
+            let x1 = (x0 + TILE).min(src_w);
+            for y0 in (0..src_h).step_by(TILE) {
+                let y1 = (y0 + TILE).min(src_h);
+                for x in x0..x1 {
+                    let orow = &mut chunk[(x - x0) * src_h..(x - x0) * src_h + src_h];
+                    for y in y0..y1 {
+                        orow[y] = data[y * src_w + x];
+                    }
+                }
+            }
+        });
     (out, src_h, src_w)
-}
-
-/// Apply extreme_1d along every column of a 2-D image (vertical morphology pass).
-/// Implemented as: transpose → morph_h → transpose back.
-fn morph_v(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<u8> {
-    let (t, tw, th) = transpose(data, w, h);
-    let r = morph_h(&t, tw, th, radius, is_max);
-    let (out, _, _) = transpose(&r, tw, th);
-    out
 }
 
 /// Morphological white top-hat transform: image − opening(image).
@@ -173,12 +202,29 @@ fn morph_v(data: &[u8], w: usize, h: usize, radius: usize, is_max: bool) -> Vec<
 /// of the given radius. Removes broad low-frequency background (gradients,
 /// vignetting, sky-glow) while preserving point-source stars.
 fn white_tophat(data: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
-    let eroded = morph_v(&morph_h(data, w, h, radius, false), w, h, radius, false);
-    let opened = morph_v(&morph_h(&eroded, w, h, radius, true), w, h, radius, true);
-    data.iter()
-        .zip(opened.iter())
-        .map(|(&a, &b)| a.saturating_sub(b))
-        .collect()
+    // Separable opening with the two middle transposes fused away. The H and V
+    // components of erosion commute (likewise dilation), and erosion fully
+    // precedes dilation, so:
+    //   minH -> T -> minH (==minV) -> maxH (==maxV) -> T -> maxH
+    // is the same opening with 2 transposes instead of 4.
+    let e1 = morph_h(data, w, h, radius, false);
+    let (t, tw, th) = transpose(&e1, w, h);
+    let e2 = morph_h(&t, tw, th, radius, false); // erosion complete (transposed)
+    let d1 = morph_h(&e2, tw, th, radius, true); // dilation, vertical component
+    let (back, bw, bh) = transpose(&d1, tw, th);
+    debug_assert_eq!((bw, bh), (w, h));
+    let opened = morph_h(&back, bw, bh, radius, true); // dilation, horizontal
+
+    // Final top-hat subtraction, parallel by row (was a serial full-image pass).
+    let mut out = vec![0u8; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let a = &data[y * w..y * w + w];
+        let o = &opened[y * w..y * w + w];
+        for (r, (&av, &ov)) in row.iter_mut().zip(a.iter().zip(o.iter())) {
+            *r = av.saturating_sub(ov);
+        }
+    });
+    out
 }
 
 #[derive(Copy, Clone)]
@@ -439,12 +485,27 @@ fn block_percentile_bg(data: &[u8], width: usize, height: usize, block_size: usi
             let y0 = by * bs;
             let x1 = (x0 + bs).min(width);
             let y1 = (y0 + bs).min(height);
-            let mut vals: Vec<u8> = Vec::with_capacity(bs * bs);
+            // 256-bin counting median (same pattern as compute_row_medians):
+            // no per-tile allocation or sort. Selects the element a sorted
+            // copy would have at index len/2, matching the previous behavior.
+            let mut hist = [0u32; 256];
             for y in y0..y1 {
-                vals.extend_from_slice(&data[y * width + x0..y * width + x1]);
+                for &px in &data[y * width + x0..y * width + x1] {
+                    hist[px as usize] += 1;
+                }
             }
-            vals.sort_unstable();
-            vals[vals.len() / 2]
+            let count = ((y1 - y0) * (x1 - x0)) as u32;
+            let target = count / 2 + 1;
+            let mut acc = 0u32;
+            let mut med = 0u8;
+            for (v, &c) in hist.iter().enumerate() {
+                acc += c;
+                if acc >= target {
+                    med = v as u8;
+                    break;
+                }
+            }
+            med
         })
         .collect();
 
@@ -1210,6 +1271,7 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 /// Args:
 ///   image: 2-D C-contiguous numpy uint8 array (height, width).
 ///   sigma: detection threshold in noise sigmas (typical 5-10; default 8).
+///          Values below 0.5 are clamped to 0.5.
 ///          The matched filter is calibrated for sigma=8 on representative
 ///          HQ Camera frames. On real-sky data with lots of correlated noise
 ///          structure, you may need to lower sigma to 6-7 to catch faint
@@ -1345,6 +1407,11 @@ fn detect_stars(
         }
     };
 
+    // Guard against pathological thresholds: sigma near 0 makes the matched-
+    // filter threshold ~1 ADU, every noise pixel becomes a candidate, and a
+    // frame can take hundreds of ms while emitting a flood of false stars.
+    // (diofinder exposes a 0-20 sigma range; 0.5 is the useful floor.)
+    let sigma = sigma.max(0.5);
     let use_global_rms = matches!(
         noise_mode.to_ascii_lowercase().as_str(),
         "global_rms" | "globalrms" | "rms" | "root_square" | "global_root_square"
@@ -1420,7 +1487,8 @@ fn detect_stars(
 ///                after dark-frame subtraction.
 ///   noise:       Pre-computed noise sigma in pixel units (typically from a
 ///                MAD on the same temporal stack used to build row_offsets).
-///   sigma:       Detection threshold in noise sigmas (default 8).
+///   sigma:       Detection threshold in noise sigmas (default 8). Values
+///                below 0.5 are clamped to 0.5.
 ///   bin:         1 or 2. With bin=2, row_offsets must be of length height/2
 ///                (one entry per row of the downsampled image).
 ///   centroid_full_res, use_neon, max_axis_ratio: same as detect_stars.
@@ -1493,6 +1561,11 @@ fn detect_stars_with_cache(
         .to_vec();
     let owned_rof: Vec<u8> = rof_slice.to_vec();
 
+    // Guard against pathological thresholds: sigma near 0 makes the matched-
+    // filter threshold ~1 ADU, every noise pixel becomes a candidate, and a
+    // frame can take hundreds of ms while emitting a flood of false stars.
+    // (diofinder exposes a 0-20 sigma range; 0.5 is the useful floor.)
+    let sigma = sigma.max(0.5);
     let tophat_r = tophat_radius as usize;
 
     let stars = py
@@ -1712,4 +1785,181 @@ fn star_detect(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_row_medians_py, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg_image(w: usize, h: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed;
+        (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// Naive O(n*r) sliding-window extreme with neutral padding — reference
+    /// for the van Herk implementation.
+    fn naive_extreme_1d(src: &[u8], radius: usize, is_max: bool) -> Vec<u8> {
+        let n = src.len();
+        let neutral = if is_max { 0u8 } else { 255u8 };
+        (0..n)
+            .map(|j| {
+                let lo = j.saturating_sub(radius);
+                let hi = (j + radius + 1).min(n);
+                let mut acc = neutral;
+                for &v in &src[lo..hi] {
+                    acc = if is_max { acc.max(v) } else { acc.min(v) };
+                }
+                acc
+            })
+            .collect()
+    }
+
+    #[test]
+    fn van_herk_matches_naive() {
+        for &n in &[1usize, 7, 31, 64, 257] {
+            for &r in &[1usize, 3, 12, 30] {
+                for &is_max in &[false, true] {
+                    let src = lcg_image(n, 1, (n * 31 + r) as u64);
+                    let mut s = MorphScratch::default();
+                    let mut out = vec![0u8; n];
+                    extreme_1d_into(&src, r, is_max, &mut s, &mut out);
+                    assert_eq!(out, naive_extreme_1d(&src, r, is_max),
+                               "n={n} r={r} is_max={is_max}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_reuse_across_calls_is_clean() {
+        // Same scratch across different radii/polarity must not leak state.
+        let mut s = MorphScratch::default();
+        let a = lcg_image(101, 1, 7);
+        let mut out = vec![0u8; 101];
+        extreme_1d_into(&a, 30, true, &mut s, &mut out); // grow buffers large
+        extreme_1d_into(&a, 3, false, &mut s, &mut out); // then small window
+        assert_eq!(out, naive_extreme_1d(&a, 3, false));
+    }
+
+    #[test]
+    fn transpose_matches_naive_and_roundtrips() {
+        for &(w, h) in &[(1usize, 1usize), (37, 53), (64, 64), (33, 95), (97, 31)] {
+            let img = lcg_image(w, h, (w * 1000 + h) as u64);
+            let (t, tw, th) = transpose(&img, w, h);
+            assert_eq!((tw, th), (h, w));
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(t[x * h + y], img[y * w + x], "({x},{y}) in {w}x{h}");
+                }
+            }
+            let (back, bw, bh) = transpose(&t, tw, th);
+            assert_eq!((bw, bh), (w, h));
+            assert_eq!(back, img);
+        }
+    }
+
+    /// Reference top-hat: the pre-fusion 4-transpose pipeline built from the
+    /// naive 1-D extreme. Byte-identical output is required.
+    fn reference_tophat(data: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+        let row_op = |img: &[u8], iw: usize, ih: usize, is_max: bool| -> Vec<u8> {
+            let mut out = vec![0u8; iw * ih];
+            for y in 0..ih {
+                out[y * iw..y * iw + iw]
+                    .copy_from_slice(&naive_extreme_1d(&img[y * iw..y * iw + iw], radius, is_max));
+            }
+            out
+        };
+        let tr = |img: &[u8], iw: usize, ih: usize| -> Vec<u8> {
+            let mut out = vec![0u8; iw * ih];
+            for y in 0..ih {
+                for x in 0..iw {
+                    out[x * ih + y] = img[y * iw + x];
+                }
+            }
+            out
+        };
+        let col_op = |img: &[u8], iw: usize, ih: usize, is_max: bool| -> Vec<u8> {
+            tr(&row_op(&tr(img, iw, ih), ih, iw, is_max), ih, iw)
+        };
+        let eroded = col_op(&row_op(data, w, h, false), w, h, false);
+        let opened = col_op(&row_op(&eroded, w, h, true), w, h, true);
+        data.iter().zip(opened.iter()).map(|(&a, &b)| a.saturating_sub(b)).collect()
+    }
+
+    #[test]
+    fn tophat_fused_matches_reference() {
+        for &(w, h, r) in &[(64usize, 48usize, 5usize), (95, 33, 12), (40, 40, 3)] {
+            let img = lcg_image(w, h, (w + h + r) as u64);
+            assert_eq!(white_tophat(&img, w, h, r), reference_tophat(&img, w, h, r),
+                       "{w}x{h} r={r}");
+        }
+    }
+
+    #[test]
+    fn block_median_matches_sorted_reference() {
+        // The histogram median must select exactly what vals.sort();vals[len/2]
+        // selected before. Compare full background outputs.
+        let sorted_block_bg = |data: &[u8], width: usize, height: usize, bs: usize| -> Vec<u8> {
+            let nx = width.div_ceil(bs);
+            let ny = height.div_ceil(bs);
+            let meds: Vec<u8> = (0..nx * ny)
+                .map(|bi| {
+                    let (bx, by) = (bi % nx, bi / nx);
+                    let (x0, y0) = (bx * bs, by * bs);
+                    let (x1, y1) = ((x0 + bs).min(width), (y0 + bs).min(height));
+                    let mut vals: Vec<u8> = Vec::new();
+                    for y in y0..y1 {
+                        vals.extend_from_slice(&data[y * width + x0..y * width + x1]);
+                    }
+                    vals.sort_unstable();
+                    vals[vals.len() / 2]
+                })
+                .collect();
+            meds
+        };
+        for &(w, h, bs) in &[(96usize, 64usize, 32usize), (100, 70, 16), (33, 33, 32)] {
+            let img = lcg_image(w, h, (w * h) as u64);
+            let want = sorted_block_bg(&img, w, h, bs);
+            // Re-derive the medians the production path computes by probing
+            // block centers of the subtracted image: instead, recompute via the
+            // same internal expression — simplest is to compare the medians by
+            // reconstructing them from block_percentile_bg with a flat image
+            // delta trick. Direct check: run production tile-median by calling
+            // block_percentile_bg on an image and comparing against a
+            // sort-reference reimplementation of the WHOLE function.
+            let bg_ref = {
+                let nx = w.div_ceil(bs);
+                let ny = h.div_ceil(bs);
+                let meds = want;
+                let half = bs as f32 / 2.0;
+                let mut out = vec![0u8; w * h];
+                for y in 0..h {
+                    let by_f = (y as f32 - half) / bs as f32;
+                    let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
+                    let by1 = (by0 + 1).min(ny - 1);
+                    let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
+                    for x in 0..w {
+                        let bx_f = (x as f32 - half) / bs as f32;
+                        let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
+                        let bx1 = (bx0 + 1).min(nx - 1);
+                        let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
+                        let m00 = meds[by0 * nx + bx0] as f32;
+                        let m10 = meds[by0 * nx + bx1] as f32;
+                        let m01 = meds[by1 * nx + bx0] as f32;
+                        let m11 = meds[by1 * nx + bx1] as f32;
+                        let bg = m00 * (1.0 - fx) * (1.0 - fy) + m10 * fx * (1.0 - fy)
+                            + m01 * (1.0 - fx) * fy + m11 * fx * fy;
+                        out[y * w + x] = img[y * w + x].saturating_sub(bg as u8);
+                    }
+                }
+                out
+            };
+            assert_eq!(block_percentile_bg(&img, w, h, bs), bg_ref, "{w}x{h} bs={bs}");
+        }
+    }
 }
