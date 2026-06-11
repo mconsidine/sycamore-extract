@@ -14,12 +14,15 @@ on:
 
 jobs:
   build_aarch64:
-    name: build aarch64 wheel for py${{ matrix.python }}
+    # The crate builds with PyO3's abi3-py38, so one wheel covers every
+    # Python >= 3.8 — a per-interpreter matrix would build the identical
+    # wheel three times.
+    name: build aarch64 wheel (abi3)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11"]
     steps:
       - uses: actions/checkout@v4
 
@@ -98,13 +101,11 @@ jobs:
           body: |
             ## Installation
 
-            On a Raspberry Pi running Pi OS Bookworm (aarch64, Python 3.13):
+            On a Raspberry Pi (aarch64, any Python >= 3.8 — the wheel is abi3):
 
             ```bash
-            pip install https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/star_detect-${{ steps.tag.outputs.name }}-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+            pip install $(curl -fsSL https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.tag.outputs.name }} | grep -o 'https://[^"]*\.whl' | head -1)
             ```
-
-            Substitute `cp311` or `cp312` for Python 3.11 or 3.12.
 
             See `CHANGELOG.md` for what changed in this release.
           generate_release_notes: true
