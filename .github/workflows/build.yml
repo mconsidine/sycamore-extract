@@ -60,12 +60,13 @@ jobs:
     needs: build_aarch64
     runs-on: ubuntu-latest
     # Run on a real tag push, OR on workflow_dispatch when the version input
-    # looks like a clean semver (vX.Y.Z with no pre-release suffix).
+    # is a version (vX.Y.Z releases; vX.Y.Z-suffix becomes a prerelease,
+    # excluded from "latest" — for branch/test builds; *-dev builds only).
     if: >
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' &&
        startsWith(github.event.inputs.version, 'v') &&
-       !contains(github.event.inputs.version, '-'))
+       !endsWith(github.event.inputs.version, '-dev'))
     permissions:
       contents: write
     steps:
@@ -108,4 +109,7 @@ jobs:
             See `CHANGELOG.md` for what changed in this release.
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # Hyphenated versions (branch/test builds) are prereleases:
+          # excluded from "latest", so consumers only get them when the
+          # tag is selected explicitly.
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
