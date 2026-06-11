@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.2
+
+- Switch the Python extension to PyO3 abi3 (`abi3-py38`): one wheel now
+  covers every CPython >= 3.8 instead of per-interpreter cp311/cp312/cp313
+  builds. No functional changes.
+- Release workflow builds the single abi3 wheel once (the per-Python matrix
+  produced identical wheels) and hyphenated versions (e.g. `v0.12.0-test`)
+  publish as prereleases, excluded from "latest".
+
+Note: the wheel attached to the v0.11.2 GitHub release was built before the
+version field was bumped and is internally versioned 0.11.1; the code is
+identical.
+
 ## 0.11.1
 
 Performance pass for the Pi Zero 2W hot paths (output is byte-identical to
