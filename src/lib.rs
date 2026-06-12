@@ -9,14 +9,17 @@
 //! Pipeline:
 //!   1. Cheap noise estimate from dark midline cuts.
 //!   2. Parallel (rayon) per-row-band scan: cache-line-sampled row-min prefilter
-//!      gates a 7-pixel integer "gate" test producing candidates. The pixel-wise
-//!      threshold prefilter is autovectorized by default and can be switched to
-//!      an explicit NEON path via `use_neon=True`.
+//!      gates an integer matched-filter "gate" test producing candidates. The
+//!      gate kernel is a runtime-generated Gaussian (width set by `kernel_sigma`,
+//!      default 1.5 = the legacy 7-tap kernel). The pixel-wise threshold
+//!      prefilter is autovectorized by default and can be switched to an
+//!      explicit NEON path via `use_neon=True`.
 //!   3. Union-find blob assembly over vertically-adjacent candidates.
 //!   4. 2-D gate (size / edge / perimeter uniformity / sigma over background
-//!      using a perimeter-derived local noise estimate).
+//!      using a perimeter-derived local noise estimate; full 2-D second-moment
+//!      axis-ratio rejection when `max_axis_ratio` is finite).
 //!   5. Background-subtracted separable projection centroid with parabolic
-//!      sub-pixel interpolation. With bin=2 and `centroid_full_res=True`,
+//!      sub-pixel interpolation. With bin>1 and `centroid_full_res=True`,
 //!      centroiding is performed on the full-resolution image for sub-pixel
 //!      precision (CedarDetect's design).
 
@@ -43,7 +46,92 @@ use std::collections::HashMap;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+// Default matched-filter gate half-width: 7-pixel gate => 3 pixels of context
+// each side. The runtime-tunable kernel (see `MatchedKernel`) generalizes this;
+// GATE_HALF remains the half-width for the default sigma=1.5 kernel and is used
+// by the standalone threshold prefilter, whose border margin is independent of
+// the gate width (it only needs >=1 px of context so the gate window is valid).
 const GATE_HALF: usize = 3; // 7-pixel gate => 3 pixels of context each side.
+
+// Maximum matched-filter kernel half-width (sigma=4.0 => ceil(2*4)=8, clamped to
+// 7 => 15 taps). Bounds stack buffers in the gate hot path.
+const MAX_KERNEL_HALF: usize = 7;
+
+// =========================================================================
+// Runtime-tunable matched-filter kernel (Feature 1)
+// =========================================================================
+//
+// The 1-D gate convolves a window with a discrete, mean-subtracted Gaussian
+// kernel and thresholds the response. Historically the kernel was the hardcoded
+// constant `[-50, -15, 35, 60, 35, -15, -50]` (sigma=1.5, 7 taps). It is now
+// generated at runtime from `kernel_sigma` so the gate can be widened for
+// bloated PSFs (poor seeing, heavy defocus) without recompiling.
+//
+// Generation (matches the documented derivation; see gate_1d comment):
+//   h     = ceil(2*sigma) clamped to [3, 7]                (half-width in px)
+//   raw   = exp(-x^2 / (2*sigma^2)) for x in -h..=h         (Gaussian samples)
+//   zm    = raw - mean(raw)                                 (mean-removed => DC=0)
+//   scale = 60 / zm[center]                                 (center coeff -> 60)
+//   k     = round(zm * scale) as i32                        (integer taps)
+//   then enforce sum(k) == 0 exactly by a symmetric residual adjustment on the
+//   outermost taps (the kernel is symmetric, so any rounding residual is split
+//   evenly across the two ends; an odd remainder lands on the leftmost tap).
+//
+// At sigma=1.5 this reproduces the exact historical constant kernel (verified
+// by unit test `kernel_sigma_1_5_matches_legacy`), so default-path results are
+// bit-identical to pre-0.12 behavior.
+#[derive(Clone)]
+struct MatchedKernel {
+    taps: Vec<i32>,
+    half: usize,
+    // L2 norm used to scale the response threshold. For the default sigma=1.5
+    // kernel this is forced to exactly 107.0 (the historical hardcoded value,
+    // a slight conservative round of sqrt(11500) ~= 107.238) so default results
+    // do not shift; for all other kernels it is the true computed ||k||_2.
+    l2: f64,
+}
+
+fn generate_matched_kernel(sigma: f64) -> MatchedKernel {
+    let h = (2.0 * sigma).ceil() as usize;
+    let h = h.clamp(3, MAX_KERNEL_HALF);
+    let n = 2 * h + 1;
+
+    let raw: Vec<f64> = (0..n)
+        .map(|i| {
+            let x = i as f64 - h as f64;
+            (-(x * x) / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let mean = raw.iter().sum::<f64>() / n as f64;
+    let zm: Vec<f64> = raw.iter().map(|r| r - mean).collect();
+    let center = zm[h];
+    let scale = 60.0 / center;
+    let mut taps: Vec<i32> = zm.iter().map(|z| (z * scale).round() as i32).collect();
+
+    // Enforce sum == 0 by a symmetric residual adjustment on the outermost taps.
+    let residual: i32 = taps.iter().sum();
+    if residual != 0 {
+        let half = residual / 2;
+        taps[0] -= half;
+        taps[n - 1] -= half;
+        let rem = residual - 2 * half; // -1, 0, or +1 (sign of residual)
+        if rem != 0 {
+            taps[0] -= rem;
+        }
+    }
+    debug_assert_eq!(taps.iter().sum::<i32>(), 0, "kernel must be DC-free");
+
+    // L2 norm. Preserve exact 107.0 for the default kernel so default results
+    // don't shift (the old hot path used 107.0, not sqrt(11500)).
+    const DEFAULT_KERNEL: [i32; 7] = [-50, -15, 35, 60, 35, -15, -50];
+    let l2 = if taps == DEFAULT_KERNEL {
+        107.0
+    } else {
+        taps.iter().map(|&t| (t * t) as f64).sum::<f64>().sqrt()
+    };
+
+    MatchedKernel { taps, half: h, l2 }
+}
 
 /// Background-floor estimation strategy used by the prefilter and by the 2-D
 /// gate's perimeter check.
@@ -84,13 +172,7 @@ pub enum BgMode {
 /// Window size = 2*radius+1. Boundary elements use a reduced (clamped) window.
 /// O(n) via the van Herk / Gil-Werman prefix–suffix block trick with neutral
 /// padding so boundary windows work correctly without special-casing.
-fn extreme_1d_into(
-    src: &[u8],
-    radius: usize,
-    is_max: bool,
-    s: &mut MorphScratch,
-    out: &mut [u8],
-) {
+fn extreme_1d_into(src: &[u8], radius: usize, is_max: bool, s: &mut MorphScratch, out: &mut [u8]) {
     let n = src.len();
     if n == 0 {
         return;
@@ -280,42 +362,48 @@ struct Star {
 // Local-maximum suppression: avoid double-claiming neighbors that are part
 // of the same star. Three-pixel local-max test with deterministic tie-breaks
 // so the same star always picks the same representative pixel.
+//
+// `g` is the (2*half+1)-pixel window; `kernel.taps` has the same length. The
+// matched-filter response is the dot product <g, kernel> (an i32). The
+// local-max test and tie-breaks operate on the three central raw pixels
+// (g[half-1], g[half], g[half+1]) exactly as in the original 7-tap gate, which
+// is independent of the kernel width.
 #[inline(always)]
-fn gate_1d(g: &[u8], mf_thresh: i32) -> bool {
-    let g0 = g[0] as i32;
-    let g1 = g[1] as i32;
-    let g2 = g[2] as i32;
-    let g3 = g[3] as i32;
-    let g4 = g[4] as i32;
-    let g5 = g[5] as i32;
-    let g6 = g[6] as i32;
-
-    // Dot product with kernel [-50, -15, 35, 60, 35, -15, -50].
-    let response = -50 * (g0 + g6) - 15 * (g1 + g5) + 35 * (g2 + g4) + 60 * g3;
+fn gate_1d(g: &[u8], kernel: &MatchedKernel, mf_thresh: i32) -> bool {
+    let half = kernel.half;
+    let mut response = 0i32;
+    for (gi, &k) in g.iter().zip(kernel.taps.iter()) {
+        response += (*gi as i32) * k;
+    }
     if response < mf_thresh {
         return false;
     }
-    // Local-maximum suppression in raw pixel space.
-    if g2 > g3 || g3 < g4 {
+    // Local-maximum suppression in raw pixel space (three central pixels).
+    let c1 = g[half - 1] as i32; // left of center
+    let c = g[half] as i32; // center
+    let c2 = g[half + 1] as i32; // right of center
+    if c1 > c || c < c2 {
         return false;
     }
-    // Deterministic tie-breaks for flat-topped peaks.
-    if g2 == g3 && g1 > g4 {
+    // Deterministic tie-breaks for flat-topped peaks. The original 7-tap gate
+    // compared the next-out neighbors (g1 vs g4, g2 vs g5); generalized, those
+    // are g[half-2] vs g[half+1] and g[half-1] vs g[half+2].
+    if c1 == c && (g[half - 2] as i32) > c2 {
         return false;
     }
-    if g3 == g4 && g2 <= g5 {
+    if c == c2 && c1 <= (g[half + 2] as i32) {
         return false;
     }
     true
 }
 
 // Compute the matched-filter threshold from sigma/noise. Kept as a function
-// so the caller can compute it once per band, not per pixel.
+// so the caller can compute it once per band, not per pixel. Uses the kernel's
+// L2 norm: for the default sigma=1.5 kernel this is exactly 107.0 (preserving
+// pre-0.12 behavior); for wider kernels it is the true ||k||_2.
 #[inline]
-fn mf_threshold(sigma: f64, noise: f64) -> i32 {
-    // Kernel L2 norm: ~107.24 (sigma=1.5 Gaussian, see gate_1d derivation).
-    // We use 107 (slight conservative round) to avoid f64 math in the hot path.
-    let t = sigma * noise * 107.0 + 0.5;
+fn mf_threshold(sigma: f64, noise: f64, kernel: &MatchedKernel) -> i32 {
+    let t = sigma * noise * kernel.l2 + 0.5;
     t.clamp(1.0, i32::MAX as f64) as i32
 }
 
@@ -438,25 +526,29 @@ fn compute_col_medians(data: &[u8], width: usize, height: usize) -> Vec<u8> {
 /// Subtract a per-row floor from every pixel (saturating). Returns a new image.
 fn subtract_row_floor(data: &[u8], width: usize, height: usize, floors: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; width * height];
-    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
-        let row_in = &data[y * width..y * width + width];
-        let f = floors[y];
-        for (o, &p) in row_out.iter_mut().zip(row_in.iter()) {
-            *o = p.saturating_sub(f);
-        }
-    });
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            let row_in = &data[y * width..y * width + width];
+            let f = floors[y];
+            for (o, &p) in row_out.iter_mut().zip(row_in.iter()) {
+                *o = p.saturating_sub(f);
+            }
+        });
     out
 }
 
 /// Subtract a per-column floor from every pixel (saturating). Returns a new image.
 fn subtract_col_floor(data: &[u8], width: usize, height: usize, floors: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; width * height];
-    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
-        let row_in = &data[y * width..y * width + width];
-        for (x, (o, &p)) in row_out.iter_mut().zip(row_in.iter()).enumerate() {
-            *o = p.saturating_sub(floors[x]);
-        }
-    });
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            let row_in = &data[y * width..y * width + width];
+            for (x, (o, &p)) in row_out.iter_mut().zip(row_in.iter()).enumerate() {
+                *o = p.saturating_sub(floors[x]);
+            }
+        });
     out
 }
 
@@ -473,9 +565,23 @@ fn subtract_col_floor(data: &[u8], width: usize, height: usize, floors: &[u8]) -
 /// (bin=1). Parallelised: per-tile medians and per-row interpolation fan out.
 fn block_percentile_bg(data: &[u8], width: usize, height: usize, block_size: usize) -> Vec<u8> {
     let bs = block_size.max(2);
+    let (block_medians, nx, ny) = compute_block_medians(data, width, height, bs);
+    subtract_block_grid(data, width, height, bs, &block_medians, nx, ny)
+}
+
+/// Compute the per-tile median grid for `block_percentile`, exposed so it can be
+/// cached temporally (Feature 5). Returns (grid, nx, ny) where the grid is
+/// row-major (ny rows of nx tiles). Same 256-bin counting median as
+/// `block_percentile_bg`, parallel over tiles.
+fn compute_block_medians(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    block_size: usize,
+) -> (Vec<u8>, usize, usize) {
+    let bs = block_size.max(2);
     let nx = width.div_ceil(bs);
     let ny = height.div_ceil(bs);
-
     let block_medians: Vec<u8> = (0..nx * ny)
         .into_par_iter()
         .map(|bi| {
@@ -485,9 +591,6 @@ fn block_percentile_bg(data: &[u8], width: usize, height: usize, block_size: usi
             let y0 = by * bs;
             let x1 = (x0 + bs).min(width);
             let y1 = (y0 + bs).min(height);
-            // 256-bin counting median (same pattern as compute_row_medians):
-            // no per-tile allocation or sort. Selects the element a sorted
-            // copy would have at index len/2, matching the previous behavior.
             let mut hist = [0u32; 256];
             for y in y0..y1 {
                 for &px in &data[y * width + x0..y * width + x1] {
@@ -508,31 +611,47 @@ fn block_percentile_bg(data: &[u8], width: usize, height: usize, block_size: usi
             med
         })
         .collect();
+    (block_medians, nx, ny)
+}
 
+/// Subtract a bilinearly-interpolated block-median background grid (saturating).
+/// Shared by `block_percentile_bg` (per-frame) and the cached block path.
+fn subtract_block_grid(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    block_size: usize,
+    block_medians: &[u8],
+    nx: usize,
+    ny: usize,
+) -> Vec<u8> {
+    let bs = block_size.max(2);
     let half_bs = bs as f32 / 2.0;
     let mut out = vec![0u8; width * height];
-    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
-        let row_in = &data[y * width..y * width + width];
-        let by_f = (y as f32 - half_bs) / bs as f32;
-        let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
-        let by1 = (by0 + 1).min(ny - 1);
-        let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
-        for (x, (o, &pixel)) in row_out.iter_mut().zip(row_in.iter()).enumerate() {
-            let bx_f = (x as f32 - half_bs) / bs as f32;
-            let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
-            let bx1 = (bx0 + 1).min(nx - 1);
-            let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
-            let m00 = block_medians[by0 * nx + bx0] as f32;
-            let m10 = block_medians[by0 * nx + bx1] as f32;
-            let m01 = block_medians[by1 * nx + bx0] as f32;
-            let m11 = block_medians[by1 * nx + bx1] as f32;
-            let bg = m00 * (1.0 - fx) * (1.0 - fy)
-                + m10 * fx * (1.0 - fy)
-                + m01 * (1.0 - fx) * fy
-                + m11 * fx * fy;
-            *o = pixel.saturating_sub(bg as u8);
-        }
-    });
+    out.par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row_out)| {
+            let row_in = &data[y * width..y * width + width];
+            let by_f = (y as f32 - half_bs) / bs as f32;
+            let by0 = (by_f.floor() as isize).max(0).min(ny as isize - 1) as usize;
+            let by1 = (by0 + 1).min(ny - 1);
+            let fy = (by_f - by0 as f32).clamp(0.0, 1.0);
+            for (x, (o, &pixel)) in row_out.iter_mut().zip(row_in.iter()).enumerate() {
+                let bx_f = (x as f32 - half_bs) / bs as f32;
+                let bx0 = (bx_f.floor() as isize).max(0).min(nx as isize - 1) as usize;
+                let bx1 = (bx0 + 1).min(nx - 1);
+                let fx = (bx_f - bx0 as f32).clamp(0.0, 1.0);
+                let m00 = block_medians[by0 * nx + bx0] as f32;
+                let m10 = block_medians[by0 * nx + bx1] as f32;
+                let m01 = block_medians[by1 * nx + bx0] as f32;
+                let m11 = block_medians[by1 * nx + bx1] as f32;
+                let bg = m00 * (1.0 - fx) * (1.0 - fy)
+                    + m10 * fx * (1.0 - fy)
+                    + m01 * (1.0 - fx) * fy
+                    + m11 * fx * fy;
+                *o = pixel.saturating_sub(bg as u8);
+            }
+        });
     out
 }
 
@@ -584,8 +703,7 @@ fn uniform_mean_bg(data: &[u8], width: usize, height: usize, filter_size: usize)
             let x1 = (x + half + 1).min(w);
             let area = ((y1 - y0) * (x1 - x0)) as u32;
             // SAT rectangle query: sum(y0..y1, x0..x1).
-            let sum = sat[y1 * (w + 1) + x1]
-                + sat[y0 * (w + 1) + x0]
+            let sum = sat[y1 * (w + 1) + x1] + sat[y0 * (w + 1) + x0]
                 - sat[y0 * (w + 1) + x1]
                 - sat[y1 * (w + 1) + x0];
             let mean = (sum / area) as u8;
@@ -647,8 +765,10 @@ fn scan_band(
     sn2: i32,
     use_neon: bool,
     row_floors: Option<&[u8]>,
+    kernel: &MatchedKernel,
     mf_thresh: i32,
 ) -> Vec<Candidate> {
+    let gate_half = kernel.half;
     let half = (sn2 / 2).clamp(0, 255) as u8;
     let mut out = Vec::new();
     let mut hits: Vec<u32> = Vec::with_capacity(64);
@@ -697,13 +817,15 @@ fn scan_band(
         }
 
         // For each pixel that cleared the prefilter, run the matched-filter gate.
+        // The gate window spans [x-gate_half, x+gate_half]; gate_half generalizes
+        // the old fixed 3 to the runtime kernel half-width.
         for &x in &hits {
             let x = x as usize;
-            if x < GATE_HALF || x + GATE_HALF >= width {
+            if x < gate_half || x + gate_half >= width {
                 continue;
             }
-            let g = &row[x - GATE_HALF..x + GATE_HALF + 1];
-            if gate_1d(g, mf_thresh) {
+            let g = &row[x - gate_half..x + gate_half + 1];
+            if gate_1d(g, kernel, mf_thresh) {
                 out.push(Candidate {
                     x: x as u32,
                     y: y as u32,
@@ -822,6 +944,22 @@ fn ring_stats(
     (mean, mn, mx, var.sqrt())
 }
 
+// Squared axis ratio (lambda_max / lambda_min) of the symmetric 2x2 covariance
+// [[vx, cxy], [cxy, vy]], via closed-form eigenvalues
+//   lambda = t/2 +/- sqrt((t/2)^2 - d),  t = vx+vy (trace), d = vx*vy - cxy^2.
+// Returning the squared ratio lets callers compare against max_axis_ratio^2
+// without a sqrt. The off-diagonal term cxy is what lets this detect
+// diagonally-elongated trails that a var_x/var_y-only test cannot see.
+#[inline]
+fn cov2x2_axis_ratio2(vx: f64, vy: f64, cxy: f64) -> f64 {
+    let half_t = 0.5 * (vx + vy);
+    let det = vx * vy - cxy * cxy;
+    let disc = (half_t * half_t - det).max(0.0).sqrt();
+    let lam_max = half_t + disc;
+    let lam_min = (half_t - disc).max(1e-6);
+    lam_max / lam_min
+}
+
 // 3-point parabolic peak of a 1-D projection. Returns sub-pixel index.
 fn parabolic_peak(v: &[f64]) -> f64 {
     if v.is_empty() {
@@ -867,6 +1005,7 @@ fn gate_2d(
     scale: usize,
     noise: f64,
     sigma: f64,
+    local_noise: bool,
     max_size: usize,
     max_axis_ratio: f64,
 ) -> Option<Star> {
@@ -900,8 +1039,16 @@ fn gate_2d(
     if (p_max as f64 - p_min as f64) > 3.0 * sigma * noise {
         return None; // perimeter not uniform
     }
-    let local_noise = noise.max(p_std);
-    if core_mean - bg_det < sigma * local_noise {
+    // Feature 3: perimeter-derived local noise inflation (concept inspired by
+    // cedar-detect, Apache-2.0; independent implementation — no code copied).
+    // The acceptance test compares core brightness above background against
+    // sigma * effective_noise, where effective_noise = max(global, ring_spread).
+    // In cluttered/noisy neighborhoods (moon halo, clouds, foreground glow) the
+    // ring's own scatter (p_std) raises the local bar and suppresses false
+    // positives; on clean sky p_std < global noise so behavior is unchanged.
+    // `local_noise=false` disables it (uses the global noise only) for A/B.
+    let effective_noise = if local_noise { noise.max(p_std) } else { noise };
+    if core_mean - bg_det < sigma * effective_noise {
         return None; // core not bright enough above local background
     }
 
@@ -942,17 +1089,21 @@ fn gate_2d(
         }
     }
 
-    // Cheap axis-ratio rejection. Derive the second moments of the centroid
-    // box from the already-computed separable projections. This catches trails
-    // (long in one direction, short in the other) and grossly bloomed stars
-    // without needing a full 2-D moment pass.
+    // Feature 2: full 2-D second-moment axis-ratio rejection. The axis ratio is
+    // sqrt(lambda_max / lambda_min) of the 2x2 covariance
+    //   [[var_x, cov_xy], [cov_xy, var_y]]
+    // computed (background-subtracted, negative-clamped weights) over the
+    // centroid box. Including the off-diagonal moment cov_xy lets this catch
+    // *diagonally* elongated trails (satellite / aircraft streaks) that the old
+    // separable var_x/var_y-only test could not see. Closed-form eigenvalues of
+    // a symmetric 2x2 are used (no iterative solve).
     //
-    // Note: this is a strict subset of olive-solve's eigendecomposition
-    // (we don't compute m2_xy, the off-diagonal moment, because projections
-    // don't give it cheaply). For a finder this is plenty; for astrometry it
-    // would not be.
+    // Cost discipline: this requires a single extra 2-D accumulation pass over
+    // the (small, per-blob) box. It is skipped entirely when max_axis_ratio is
+    // infinite (the common default), so the hot path pays nothing for it.
     if brightness > 0.0 && max_axis_ratio.is_finite() && max_axis_ratio > 1.0 {
         let inv_b = 1.0 / brightness;
+        // First moments (centroid within the box) from the cheap projections.
         let mut m1x = 0f64;
         for (i, &v) in hproj.iter().enumerate() {
             m1x += (i as f64) * v;
@@ -963,22 +1114,32 @@ fn gate_2d(
             m1y += (j as f64) * v;
         }
         m1y *= inv_b;
+
+        // Second moments via one 2-D pass over the box (same weights as the
+        // projections: background-subtracted, negative-clamped).
         let mut var_x = 0f64;
-        for (i, &v) in hproj.iter().enumerate() {
-            let d = i as f64 - m1x;
-            var_x += d * d * v;
+        let mut var_y = 0f64;
+        let mut cov_xy = 0f64;
+        for yy in 0..mh {
+            let row = &cent_img[(my0 + yy) * cent_w..(my0 + yy) * cent_w + cent_w];
+            let dy = yy as f64 - m1y;
+            for xx in 0..mw {
+                let val = (row[mx0 + xx] as f64 - bg_cent).max(0.0);
+                if val > 0.0 {
+                    let dx = xx as f64 - m1x;
+                    var_x += dx * dx * val;
+                    var_y += dy * dy * val;
+                    cov_xy += dx * dy * val;
+                }
+            }
         }
         var_x *= inv_b;
-        let mut var_y = 0f64;
-        for (j, &v) in vproj.iter().enumerate() {
-            let d = j as f64 - m1y;
-            var_y += d * d * v;
-        }
         var_y *= inv_b;
-        let major2 = var_x.max(var_y);
-        let minor2 = var_x.min(var_y).max(1e-6);
-        // (major/minor)^2 > threshold^2; avoid sqrt.
-        if major2 / minor2 > max_axis_ratio * max_axis_ratio {
+        cov_xy *= inv_b;
+
+        // axis_ratio = sqrt(lam_max/lam_min) of [[var_x, cov_xy],[cov_xy, var_y]];
+        // reject if it exceeds max_axis_ratio (see cov2x2_axis_ratio2).
+        if cov2x2_axis_ratio2(var_x, var_y, cov_xy) > max_axis_ratio * max_axis_ratio {
             return None;
         }
     }
@@ -1115,6 +1276,13 @@ fn bin2x2_mean(data: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
     (out, wb, hb)
 }
 
+// 4x4 mean bin = two cascaded 2x2 mean bins. Used by bin=4 (escape hatch for
+// badly defocused / oversampled stars). Coordinates map x4 to full-res.
+fn bin4x4_mean(data: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
+    let (b2, w2, h2) = bin2x2_mean(data, w, h);
+    bin2x2_mean(&b2, w2, h2)
+}
+
 // =========================================================================
 // Top-level detection
 // =========================================================================
@@ -1132,12 +1300,14 @@ fn detect(
     use_neon: bool,
     bg_mode: BgMode,
     max_axis_ratio: f64,
+    kernel: &MatchedKernel,
+    local_noise: bool,
 ) -> Vec<Star> {
     if det_w < 7 || det_h < 7 {
         return Vec::new();
     }
     let sn2 = ((2.0 * sigma * noise + 0.5) as i32).max(2);
-    let mf_thresh = mf_threshold(sigma, noise);
+    let mf_thresh = mf_threshold(sigma, noise, kernel);
 
     // LineMedian: precompute one median per row in parallel. This is the
     // equivalent of olive-solve's FastBgSubMode::LineMedian and handles:
@@ -1169,6 +1339,7 @@ fn detect(
                     sn2,
                     use_neon,
                     row_floors.as_deref(),
+                    kernel,
                     mf_thresh,
                 )
             }
@@ -1197,6 +1368,7 @@ fn detect(
                 scale,
                 noise,
                 sigma,
+                local_noise,
                 max_size,
                 max_axis_ratio,
             )
@@ -1277,9 +1449,11 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///          structure, you may need to lower sigma to 6-7 to catch faint
 ///          stars near the noise floor. Field validation is encouraged.
 ///   noise: optional precomputed noise level; estimated if None.
-///   bin:   1 (full res) or 2 (detect on a 2x2-binned image for speed). Centroids
-///          are returned in full-resolution pixel coordinates regardless.
-///   centroid_full_res: when bin=2, perform centroiding on the full-resolution
+///   bin:   1 (full res), 2 (2x2-binned detection for speed), or 4 (4x4-binned,
+///          two cascaded 2x2 mean bins — the escape hatch for badly defocused /
+///          oversampled stars). Centroids are returned in full-resolution pixel
+///          coordinates regardless.
+///   centroid_full_res: when bin>1, perform centroiding on the full-resolution
 ///          image. Slightly more work per star, but recovers the sub-pixel
 ///          precision that scaling-from-binned loses. No effect when bin=1.
 ///   use_neon: when true and built for aarch64, use the explicit NEON threshold
@@ -1311,7 +1485,19 @@ fn set_num_threads(n: usize) -> PyResult<()> {
 ///       bg_block_size (default 32 at bin=2; scale up for bin=1).
 ///   max_axis_ratio: optional cap on detected blob elongation. A trail or
 ///          satellite streak has axis_ratio >> 1; an in-focus star is ~1.
-///          Default Inf (no filtering). Recommend 3-5 for a finder.
+///          Default Inf (no filtering). Recommend 3-5 for a finder. When finite,
+///          rejection uses the full 2x2 second-moment covariance (including the
+///          off-diagonal m2_xy term) so diagonal trails are caught too.
+///   local_noise: when True (default), inflate the per-blob acceptance noise to
+///          max(global_noise, perimeter_ring_spread). This raises the bar in
+///          cluttered/noisy neighborhoods (moon halo, clouds, foreground glow)
+///          and suppresses false positives there; clean-sky behavior is
+///          unchanged (ring spread < global noise). Set False for A/B testing.
+///   kernel_sigma: Gaussian sigma (px) of the matched-filter kernel, range
+///          1.0-4.0 (ValueError outside). Default 1.5 reproduces the historical
+///          7-tap kernel exactly (bit-identical results). Larger values widen
+///          the kernel (sigma=2.5 -> 11 taps, sigma=4.0 -> 15 taps) to better
+///          match bloated PSFs from poor seeing or heavy defocus.
 ///   tophat_radius: structuring-element radius for the white top-hat (pixels,
 ///          default 0 = use 12). Must exceed the largest star radius. Only
 ///          used when bg_mode="top_hat".
@@ -1352,6 +1538,8 @@ fn set_num_threads(n: usize) -> PyResult<()> {
     bg_block_size=0u32,
     uniform_filter_size=0u32,
     noise_mode="mad",
+    kernel_sigma=1.5,
+    local_noise=true,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars(
@@ -1368,6 +1556,8 @@ fn detect_stars(
     bg_block_size: u32,
     uniform_filter_size: u32,
     noise_mode: &str,
+    kernel_sigma: f64,
+    local_noise: bool,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -1381,7 +1571,11 @@ fn detect_stars(
         }
         "line_median" | "linemedian" | "row_median" => (BgMode::LineMedian, SpatialBg::None),
         "top_hat" | "tophat" | "white_tophat" => {
-            let r = if tophat_radius == 0 { 12 } else { tophat_radius as usize };
+            let r = if tophat_radius == 0 {
+                12
+            } else {
+                tophat_radius as usize
+            };
             (BgMode::RowPercentile, SpatialBg::TopHat(r))
         }
         "column_percentile" | "col_percentile" | "colpercentile" => {
@@ -1391,11 +1585,19 @@ fn detect_stars(
             (BgMode::RowPercentile, SpatialBg::RowColPercentile)
         }
         "block_percentile" | "blockpercentile" | "block_median" => {
-            let bs = if bg_block_size == 0 { 32 } else { bg_block_size as usize };
+            let bs = if bg_block_size == 0 {
+                32
+            } else {
+                bg_block_size as usize
+            };
             (BgMode::RowPercentile, SpatialBg::BlockPercentile(bs))
         }
         "uniform_mean" | "uniformmean" | "local_mean" | "box_filter" => {
-            let fs = if uniform_filter_size == 0 { 25 } else { uniform_filter_size as usize };
+            let fs = if uniform_filter_size == 0 {
+                25
+            } else {
+                uniform_filter_size as usize
+            };
             (BgMode::RowPercentile, SpatialBg::UniformMean(fs))
         }
         other => {
@@ -1417,6 +1619,14 @@ fn detect_stars(
         "global_rms" | "globalrms" | "rms" | "root_square" | "global_root_square"
     );
 
+    // Validate and build the matched-filter kernel (Feature 1). Range 1.0-4.0.
+    if !(1.0..=4.0).contains(&kernel_sigma) {
+        return Err(PyValueError::new_err(format!(
+            "kernel_sigma must be in [1.0, 4.0]; got {kernel_sigma}"
+        )));
+    }
+    let kernel = generate_matched_kernel(kernel_sigma);
+
     // Copy the image into a Rust-owned buffer so we can drop the GIL.
     // ~0.7 MB on a 0.73 MP frame; ~1 ms memcpy on the Zero 2W. The win is that
     // every other Python thread can run during the multi-millisecond compute.
@@ -1435,30 +1645,96 @@ fn detect_stars(
                     let preproc = apply_spatial_bg(&owned, w, h, &spatial);
                     let det: &[u8] = preproc.as_deref().unwrap_or(&owned);
                     let nz = noise.unwrap_or_else(|| {
-                        if use_global_rms { estimate_noise_global_rms(det, w, h) }
-                        else { estimate_noise(det, w, h) }
+                        if use_global_rms {
+                            estimate_noise_global_rms(det, w, h)
+                        } else {
+                            estimate_noise(det, w, h)
+                        }
                     });
-                    Ok(detect(det, w, h, &owned, w, h, 1, sigma, nz, use_neon, bg, max_axis_ratio))
+                    Ok(detect(
+                        det,
+                        w,
+                        h,
+                        &owned,
+                        w,
+                        h,
+                        1,
+                        sigma,
+                        nz,
+                        use_neon,
+                        bg,
+                        max_axis_ratio,
+                        &kernel,
+                        local_noise,
+                    ))
                 }
-                2 => {
-                    let (b, wb, hb) = bin2x2_mean(&owned, w, h);
+                2 | 4 => {
+                    // bin=2: one 2x2 mean bin (scale 2). bin=4: two cascaded 2x2
+                    // mean bins (scale 4) — the escape hatch for badly defocused
+                    // or oversampled stars. Noise/background estimation runs on
+                    // the binned image; with centroid_full_res the centroid is
+                    // taken on the full-res image with coords mapped x{scale}.
+                    let scale = bin as usize;
+                    let (b, wb, hb) = if bin == 2 {
+                        bin2x2_mean(&owned, w, h)
+                    } else {
+                        bin4x4_mean(&owned, w, h)
+                    };
                     let preproc = apply_spatial_bg(&b, wb, hb, &spatial);
                     let det: &[u8] = preproc.as_deref().unwrap_or(&b);
                     let nz = noise.unwrap_or_else(|| {
-                        if use_global_rms { estimate_noise_global_rms(det, wb, hb) }
-                        else { estimate_noise(det, wb, hb) }
+                        if use_global_rms {
+                            estimate_noise_global_rms(det, wb, hb)
+                        } else {
+                            estimate_noise(det, wb, hb)
+                        }
                     });
                     let result = if centroid_full_res {
-                        detect(det, wb, hb, &owned, w, h, 2, sigma, nz, use_neon, bg, max_axis_ratio)
+                        detect(
+                            det,
+                            wb,
+                            hb,
+                            &owned,
+                            w,
+                            h,
+                            scale,
+                            sigma,
+                            nz,
+                            use_neon,
+                            bg,
+                            max_axis_ratio,
+                            &kernel,
+                            local_noise,
+                        )
                     } else {
-                        detect(det, wb, hb, &b, wb, hb, 1, sigma, nz, use_neon, bg, max_axis_ratio)
-                            .into_iter()
-                            .map(|s| Star { x: s.x * 2.0, y: s.y * 2.0, ..s })
-                            .collect()
+                        let sc = scale as f64;
+                        detect(
+                            det,
+                            wb,
+                            hb,
+                            &b,
+                            wb,
+                            hb,
+                            1,
+                            sigma,
+                            nz,
+                            use_neon,
+                            bg,
+                            max_axis_ratio,
+                            &kernel,
+                            local_noise,
+                        )
+                        .into_iter()
+                        .map(|s| Star {
+                            x: s.x * sc,
+                            y: s.y * sc,
+                            ..s
+                        })
+                        .collect()
                     };
                     Ok(result)
                 }
-                _ => Err("bin must be 1 or 2"),
+                _ => Err("bin must be 1, 2, or 4"),
             })
         })
         .map_err(PyValueError::new_err)?;
@@ -1469,58 +1745,76 @@ fn detect_stars(
         .collect())
 }
 
-/// Detect stars using a pre-computed per-row background floor and noise sigma.
+/// Detect stars using a pre-computed background model and noise sigma.
 ///
 /// This is the steady-state "cached" entry point intended for use inside a
 /// finder's tracking-state loop. A background worker periodically computes a
-/// high-quality row-offset model (median across N stacked frames) plus a noise
-/// sigma estimate, and this function consumes them directly — no per-frame
+/// high-quality background model (median across N stacked frames) plus a noise
+/// sigma estimate, and this function consumes it directly — no per-frame
 /// noise estimation, no per-row median computation. The result is detection
 /// that is both faster and *more accurate* than per-frame estimation, because
 /// the background model was computed over temporal data.
 ///
+/// Two cached background models are supported (exactly one must be supplied):
+///
+///   * `row_offsets` — a 1-D per-row floor (the original cache model). Cheapest;
+///     handles per-row offset noise and vertical gradients.
+///   * `block_offsets` — a 2-D grid of per-tile medians (from
+///     `compute_block_medians_py`). Bilinearly interpolated and subtracted, this
+///     removes *non-separable* 2-D gradients (vignetting, sky-glow, light
+///     pollution) — the first time 2-D background correction composes with the
+///     temporal cache. After subtraction, detection uses the standard inline
+///     row-percentile floor on the corrected image.
+///
 /// Args:
 ///   image:       2-D C-contiguous numpy uint8 array (height, width).
-///   row_offsets: 1-D numpy uint8 array of length `height`. The per-row
-///                background floor in image pixel units. Typically the median
-///                value of each row in the dark-sky reference, optionally
-///                after dark-frame subtraction.
+///   row_offsets: optional 1-D numpy uint8 array of length `height // bin`. The
+///                per-row background floor in (binned) image pixel units.
+///                Positional for backward compatibility. Pass None to use
+///                block_offsets instead.
 ///   noise:       Pre-computed noise sigma in pixel units (typically from a
-///                MAD on the same temporal stack used to build row_offsets).
+///                MAD on the same temporal stack used to build the model).
 ///   sigma:       Detection threshold in noise sigmas (default 8). Values
 ///                below 0.5 are clamped to 0.5.
-///   bin:         1 or 2. With bin=2, row_offsets must be of length height/2
-///                (one entry per row of the downsampled image).
-///   centroid_full_res, use_neon, max_axis_ratio: same as detect_stars.
-///   tophat_radius: when > 0, apply white top-hat to the detection image
-///          before using the cached row_floors. The cached noise estimate is
-///          still used for thresholding. Centroids are taken on the original
-///          (pre-tophat) image. Default 0 (disabled).
+///   bin:         1, 2, or 4. The cached model length must match the binned
+///                detection image (`height // bin` rows for row_offsets;
+///                `compute_block_medians_py` run at the same binning for
+///                block_offsets).
+///   centroid_full_res, use_neon, max_axis_ratio, kernel_sigma, local_noise:
+///                same as detect_stars.
+///   tophat_radius: when > 0, apply white top-hat to the detection image before
+///                using the cached row_floors. Only valid with row_offsets.
+///                Centroids are taken on the original image. Default 0.
+///   block_offsets: optional 2-D numpy uint8 grid of per-tile medians (keyword-
+///                only). Mutually exclusive with row_offsets.
+///   block_size:  tile side length (px) that produced block_offsets (default 32).
 ///
-/// The caller is responsible for refreshing row_offsets and noise when the
-/// scene changes (slew, moon angle shift, twilight progression). If the
-/// cached state is stale, detected counts will drop and false positives may
-/// rise; the application's state machine should fall back to detect_stars()
-/// in those regimes.
+/// The caller is responsible for refreshing the model and noise when the scene
+/// changes (slew, moon angle shift, twilight progression).
 ///
 /// Returns: list of (x, y, brightness, peak), brightest first.
 #[pyfunction]
 #[pyo3(signature = (
     image,
-    row_offsets,
-    noise,
+    row_offsets=None,
+    noise=0.0,
     sigma=8.0,
     bin=1,
     centroid_full_res=true,
     use_neon=false,
     max_axis_ratio=f64::INFINITY,
     tophat_radius=0u32,
+    kernel_sigma=1.5,
+    local_noise=true,
+    *,
+    block_offsets=None,
+    block_size=32u32,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars_with_cache(
     py: Python<'_>,
     image: PyReadonlyArray2<u8>,
-    row_offsets: numpy::PyReadonlyArray1<u8>,
+    row_offsets: Option<numpy::PyReadonlyArray1<u8>>,
     noise: f64,
     sigma: f64,
     bin: u32,
@@ -1528,140 +1822,206 @@ fn detect_stars_with_cache(
     use_neon: bool,
     max_axis_ratio: f64,
     tophat_radius: u32,
+    kernel_sigma: f64,
+    local_noise: bool,
+    block_offsets: Option<numpy::PyReadonlyArray2<u8>>,
+    block_size: u32,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
     if shape.len() != 2 {
         return Err(PyValueError::new_err("image must be 2-D"));
     }
+    if !matches!(bin, 1 | 2 | 4) {
+        return Err(PyValueError::new_err("bin must be 1, 2, or 4"));
+    }
+    let scale = bin as usize;
 
-    let expected_rows = match bin {
-        1 => h,
-        2 => h / 2,
-        _ => return Err(PyValueError::new_err("bin must be 1 or 2")),
-    };
-    let rof_slice = row_offsets
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("row_offsets must be C-contiguous uint8"))?;
-    if rof_slice.len() != expected_rows {
+    // Exactly one of row_offsets / block_offsets must be given.
+    if row_offsets.is_some() == block_offsets.is_some() {
+        return Err(PyValueError::new_err(
+            "exactly one of row_offsets / block_offsets must be supplied",
+        ));
+    }
+    if !(1.0..=4.0).contains(&kernel_sigma) {
         return Err(PyValueError::new_err(format!(
-            "row_offsets has length {} but {} were expected for bin={}",
-            rof_slice.len(),
-            expected_rows,
-            bin
+            "kernel_sigma must be in [1.0, 4.0]; got {kernel_sigma}"
         )));
     }
+    let kernel = generate_matched_kernel(kernel_sigma);
 
-    // Copy both inputs so we can drop the GIL.
+    // Binned detection-image dimensions (the model is in this space).
+    let wb = w / scale;
+    let hb = h / scale;
+
+    // Validate and copy whichever cached model was supplied.
+    let owned_rof: Option<Vec<u8>> = match &row_offsets {
+        Some(ro) => {
+            let s = ro
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("row_offsets must be C-contiguous uint8"))?;
+            if s.len() != hb {
+                return Err(PyValueError::new_err(format!(
+                    "row_offsets has length {} but {} were expected for bin={}",
+                    s.len(),
+                    hb,
+                    bin
+                )));
+            }
+            Some(s.to_vec())
+        }
+        None => None,
+    };
+
+    let block_grid: Option<(Vec<u8>, usize, usize)> = match &block_offsets {
+        Some(bo) => {
+            let bshape = bo.shape();
+            if bshape.len() != 2 {
+                return Err(PyValueError::new_err("block_offsets must be 2-D"));
+            }
+            let (gh, gw) = (bshape[0], bshape[1]);
+            let bs = if block_size == 0 {
+                32
+            } else {
+                block_size as usize
+            };
+            // The grid must match what compute_block_medians produces on the
+            // binned detection image at this block_size.
+            let exp_gw = wb.div_ceil(bs.max(2));
+            let exp_gh = hb.div_ceil(bs.max(2));
+            if gw != exp_gw || gh != exp_gh {
+                return Err(PyValueError::new_err(format!(
+                    "block_offsets shape ({gh}, {gw}) does not match expected \
+                     ({exp_gh}, {exp_gw}) for bin={bin}, block_size={bs}"
+                )));
+            }
+            let s = bo
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("block_offsets must be C-contiguous uint8"))?;
+            Some((s.to_vec(), gw, gh))
+        }
+        None => None,
+    };
+
+    if block_grid.is_some() && tophat_radius > 0 {
+        return Err(PyValueError::new_err(
+            "tophat_radius is only supported with row_offsets, not block_offsets",
+        ));
+    }
+
+    // Copy the image so we can drop the GIL.
     let owned: Vec<u8> = image
         .as_slice()
         .map_err(|_| {
             PyValueError::new_err("image must be C-contiguous uint8; use np.ascontiguousarray")
         })?
         .to_vec();
-    let owned_rof: Vec<u8> = rof_slice.to_vec();
 
-    // Guard against pathological thresholds: sigma near 0 makes the matched-
-    // filter threshold ~1 ADU, every noise pixel becomes a candidate, and a
-    // frame can take hundreds of ms while emitting a flood of false stars.
-    // (diofinder exposes a 0-20 sigma range; 0.5 is the useful floor.)
+    // Guard against pathological thresholds (see detect_stars).
     let sigma = sigma.max(0.5);
     let tophat_r = tophat_radius as usize;
+    let bs = if block_size == 0 {
+        32
+    } else {
+        block_size as usize
+    };
 
     let stars = py
         .allow_threads(|| {
             let pool = get_pool();
-            pool.install(|| match bin {
-                1 => {
+            pool.install(|| {
+                // Bin the input to the detection-image resolution (scale 1/2/4).
+                let (binned, dw, dh): (Vec<u8>, usize, usize) = match bin {
+                    1 => (Vec::new(), w, h),
+                    2 => {
+                        let (b, bw, bh) = bin2x2_mean(&owned, w, h);
+                        (b, bw, bh)
+                    }
+                    _ => {
+                        let (b, bw, bh) = bin4x4_mean(&owned, w, h);
+                        (b, bw, bh)
+                    }
+                };
+                // detection-source slice (binned or original).
+                let det_src: &[u8] = if bin == 1 { &owned } else { &binned };
+
+                // centroid image + its dims + coord scale.
+                let (cent_img, cw, ch, cscale): (&[u8], usize, usize, usize) = if bin == 1 {
+                    (&owned, w, h, 1)
+                } else if centroid_full_res {
+                    (&owned, w, h, scale)
+                } else {
+                    (det_src, dw, dh, 1)
+                };
+
+                let mut result = if let Some((grid, gnx, gny)) = &block_grid {
+                    // ---- Block-grid cached path. Subtract the bilinearly-
+                    // interpolated 2-D background, then run the standard
+                    // detection with the inline RowPercentile floor (same as the
+                    // per-frame spatial modes). The supplied `noise` is used.
+                    let corrected = subtract_block_grid(det_src, dw, dh, bs, grid, *gnx, *gny);
+                    detect(
+                        &corrected,
+                        dw,
+                        dh,
+                        cent_img,
+                        cw,
+                        ch,
+                        cscale,
+                        sigma,
+                        noise,
+                        use_neon,
+                        BgMode::RowPercentile,
+                        max_axis_ratio,
+                        &kernel,
+                        local_noise,
+                    )
+                } else {
+                    // ---- Row-offset cached path (original behavior).
+                    let rof = owned_rof.as_ref().unwrap();
                     let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
-                        Some(white_tophat(&owned, w, h, tophat_r))
+                        Some(white_tophat(det_src, dw, dh, tophat_r))
                     } else {
                         None
                     };
-                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&owned);
+                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(det_src);
                     // With tophat, the detection image background is ~0; use zero
-                    // row_floors so the threshold is sigma*noise (not inflated by
-                    // the cached original-space background level).
+                    // row_floors so the threshold is sigma*noise.
                     let zero_floors: Vec<u8>;
                     let floors: &[u8] = if tophat_r > 0 {
-                        zero_floors = vec![0u8; owned_rof.len()];
+                        zero_floors = vec![0u8; rof.len()];
                         &zero_floors
                     } else {
-                        &owned_rof
+                        rof
                     };
-                    Ok(detect_cached(
+                    detect_cached(
                         det,
-                        w,
-                        h,
-                        &owned,
-                        w,
-                        h,
-                        1,
+                        dw,
+                        dh,
+                        cent_img,
+                        cw,
+                        ch,
+                        cscale,
                         sigma,
                         noise,
                         use_neon,
                         floors,
                         max_axis_ratio,
-                    ))
+                        &kernel,
+                        local_noise,
+                    )
+                };
+
+                // When centroiding on the binned image (centroid_full_res=false,
+                // bin>1), map coords back to full-res.
+                if bin > 1 && !centroid_full_res {
+                    let sc = scale as f64;
+                    for s in result.iter_mut() {
+                        s.x *= sc;
+                        s.y *= sc;
+                    }
                 }
-                2 => {
-                    let (b, wb, hb) = bin2x2_mean(&owned, w, h);
-                    let tophat_buf: Option<Vec<u8>> = if tophat_r > 0 {
-                        Some(white_tophat(&b, wb, hb, tophat_r))
-                    } else {
-                        None
-                    };
-                    let det: &[u8] = tophat_buf.as_deref().unwrap_or(&b);
-                    let zero_floors: Vec<u8>;
-                    let floors: &[u8] = if tophat_r > 0 {
-                        zero_floors = vec![0u8; owned_rof.len()];
-                        &zero_floors
-                    } else {
-                        &owned_rof
-                    };
-                    let result = if centroid_full_res {
-                        detect_cached(
-                            det,
-                            wb,
-                            hb,
-                            &owned,
-                            w,
-                            h,
-                            2,
-                            sigma,
-                            noise,
-                            use_neon,
-                            floors,
-                            max_axis_ratio,
-                        )
-                    } else {
-                        let in_binned = detect_cached(
-                            det,
-                            wb,
-                            hb,
-                            &b,
-                            wb,
-                            hb,
-                            1,
-                            sigma,
-                            noise,
-                            use_neon,
-                            floors,
-                            max_axis_ratio,
-                        );
-                        in_binned
-                            .into_iter()
-                            .map(|s| Star {
-                                x: s.x * 2.0,
-                                y: s.y * 2.0,
-                                brightness: s.brightness,
-                                peak: s.peak,
-                            })
-                            .collect()
-                    };
-                    Ok(result)
-                }
-                _ => Err("bin must be 1 or 2"),
+                Ok::<Vec<Star>, &'static str>(result)
             })
         })
         .map_err(PyValueError::new_err)?;
@@ -1688,12 +2048,14 @@ fn detect_cached(
     use_neon: bool,
     row_floors: &[u8],
     max_axis_ratio: f64,
+    kernel: &MatchedKernel,
+    local_noise: bool,
 ) -> Vec<Star> {
     if det_w < 7 || det_h < 7 {
         return Vec::new();
     }
     let sn2 = ((2.0 * sigma * noise + 0.5) as i32).max(2);
-    let mf_thresh = mf_threshold(sigma, noise);
+    let mf_thresh = mf_threshold(sigma, noise, kernel);
 
     let n_bands = rayon::current_num_threads().max(1);
     let band_rows = det_h.div_ceil(n_bands);
@@ -1713,6 +2075,7 @@ fn detect_cached(
                     sn2,
                     use_neon,
                     Some(row_floors),
+                    kernel,
                     mf_thresh,
                 )
             }
@@ -1741,6 +2104,7 @@ fn detect_cached(
                 scale,
                 noise,
                 sigma,
+                local_noise,
                 max_size,
                 max_axis_ratio,
             )
@@ -1778,11 +2142,48 @@ fn compute_row_medians_py<'py>(
     Ok(numpy::PyArray1::from_vec_bound(py, medians))
 }
 
+/// Compute the per-tile median grid of a uint8 image (Feature 5). Returns a 2-D
+/// uint8 array of shape (grid_h, grid_w) where grid_w = ceil(width/block_size)
+/// and grid_h = ceil(height/block_size). This is the 2-D analogue of
+/// `compute_row_medians_py`: the background worker can median-stack frames in
+/// Python, then call this on the (binned) temporal-median frame to build a
+/// cached 2-D background model for `detect_stars_with_cache(block_offsets=...)`.
+///
+/// Run it at the same binning and `block_size` you will pass to
+/// `detect_stars_with_cache` so the grid dimensions line up.
+#[pyfunction]
+#[pyo3(signature = (image, block_size=32u32))]
+fn compute_block_medians_py<'py>(
+    py: Python<'py>,
+    image: PyReadonlyArray2<u8>,
+    block_size: u32,
+) -> PyResult<Bound<'py, numpy::PyArray2<u8>>> {
+    let shape = image.shape();
+    let (h, w) = (shape[0], shape[1]);
+    let data: Vec<u8> = image
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("image must be C-contiguous uint8"))?
+        .to_vec();
+    let bs = if block_size == 0 {
+        32
+    } else {
+        block_size as usize
+    };
+    let (grid, nx, ny) = py.allow_threads(|| {
+        let pool = get_pool();
+        pool.install(|| compute_block_medians(&data, w, h, bs))
+    });
+    let arr = numpy::ndarray::Array2::from_shape_vec((ny, nx), grid)
+        .map_err(|e| PyValueError::new_err(format!("grid reshape failed: {e}")))?;
+    Ok(numpy::PyArray2::from_owned_array_bound(py, arr))
+}
+
 #[pymodule]
 fn star_detect(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_stars, m)?)?;
     m.add_function(wrap_pyfunction!(detect_stars_with_cache, m)?)?;
     m.add_function(wrap_pyfunction!(compute_row_medians_py, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_block_medians_py, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
     Ok(())
 }
@@ -1795,7 +2196,9 @@ mod tests {
         let mut s = seed;
         (0..w * h)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (s >> 33) as u8
             })
             .collect()
@@ -1820,6 +2223,96 @@ mod tests {
     }
 
     #[test]
+    fn kernel_sigma_1_5_matches_legacy() {
+        // REQUIRED: sigma=1.5 must reproduce the historical hardcoded kernel
+        // exactly, so default-path results are bit-identical to pre-0.12.
+        let k = generate_matched_kernel(1.5);
+        assert_eq!(k.taps, vec![-50, -15, 35, 60, 35, -15, -50]);
+        assert_eq!(k.half, 3);
+        // L2 norm forced to exactly 107.0 for the default kernel.
+        assert_eq!(k.l2, 107.0);
+        // mf_threshold must equal the old hardcoded-107.0 computation.
+        let want = (8.0 * 2.5 * 107.0 + 0.5) as i32;
+        assert_eq!(mf_threshold(8.0, 2.5, &k), want);
+    }
+
+    #[test]
+    fn axis_ratio_2d_moments() {
+        // Round blob: var_x==var_y, cov==0 => ratio 1.
+        assert!((cov2x2_axis_ratio2(2.0, 2.0, 0.0) - 1.0).abs() < 1e-9);
+        // Axis-aligned elongation 4:1 in variance => sqrt ratio 2 => ratio^2 4.
+        assert!((cov2x2_axis_ratio2(4.0, 1.0, 0.0) - 4.0).abs() < 1e-9);
+        // Diagonal trail: equal diagonal variances but strong off-diagonal.
+        // [[3,2.9],[2.9,3]] -> lam = 3 +/- 2.9 => 5.9 / 0.1 = 59. The separable
+        // var_x/var_y-only test would see ratio 1 here and MISS the trail; the
+        // full 2x2 form correctly flags it.
+        let r2 = cov2x2_axis_ratio2(3.0, 3.0, 2.9);
+        assert!(r2 > 50.0, "diagonal trail ratio^2 = {r2}");
+        // And it would be rejected for any max_axis_ratio up to ~7.6 (sqrt 59).
+        assert!(r2 > 3.0 * 3.0);
+    }
+
+    #[test]
+    fn kernel_generation_widths_and_dc() {
+        // Half-width clamp and tap counts, and DC-free (sum==0) for all sigma.
+        for (sigma, exp_taps) in [
+            (1.0, 7usize),
+            (1.5, 7),
+            (2.0, 9),
+            (2.5, 11),
+            (3.0, 13),
+            (4.0, 15),
+        ] {
+            let k = generate_matched_kernel(sigma);
+            assert_eq!(k.taps.len(), exp_taps, "sigma={sigma}");
+            assert_eq!(k.taps.iter().sum::<i32>(), 0, "DC-free sigma={sigma}");
+            assert_eq!(k.half, exp_taps / 2);
+            // Symmetric kernel.
+            for i in 0..k.taps.len() {
+                assert_eq!(k.taps[i], k.taps[k.taps.len() - 1 - i], "sym sigma={sigma}");
+            }
+            // Center coefficient rounds to 60.
+            assert_eq!(k.taps[k.half], 60, "center sigma={sigma}");
+            // Non-default kernels use true L2 norm (not 107.0).
+            if sigma != 1.5 {
+                let true_l2 = (k.taps.iter().map(|&t| (t * t) as f64).sum::<f64>()).sqrt();
+                assert!((k.l2 - true_l2).abs() < 1e-9, "l2 sigma={sigma}");
+            }
+        }
+    }
+
+    #[test]
+    fn gate_1d_default_kernel_matches_hardcoded() {
+        // The generalized gate_1d with the sigma=1.5 kernel must produce the
+        // same response/decision as the old hardcoded dot product on a window.
+        let k = generate_matched_kernel(1.5);
+        // A clean peak window.
+        let g = [10u8, 20, 80, 200, 80, 20, 10];
+        let resp = -50 * (g[0] as i32 + g[6] as i32) - 15 * (g[1] as i32 + g[5] as i32)
+            + 35 * (g[2] as i32 + g[4] as i32)
+            + 60 * g[3] as i32;
+        let thr = resp; // threshold exactly at response: passes (>=)
+        assert!(gate_1d(&g, &k, thr));
+        assert!(!gate_1d(&g, &k, thr + 1)); // just above response: fails
+    }
+
+    #[test]
+    fn block_medians_grid_matches_block_percentile_internal() {
+        // compute_block_medians must produce the same grid the per-frame
+        // block_percentile_bg uses internally (subtracting it reproduces it).
+        for &(w, h, bs) in &[(96usize, 64usize, 32usize), (100, 70, 16)] {
+            let img = lcg_image(w, h, (w * h + bs) as u64);
+            let (grid, nx, ny) = compute_block_medians(&img, w, h, bs);
+            let via_grid = subtract_block_grid(&img, w, h, bs, &grid, nx, ny);
+            assert_eq!(
+                via_grid,
+                block_percentile_bg(&img, w, h, bs),
+                "{w}x{h} bs={bs}"
+            );
+        }
+    }
+
+    #[test]
     fn van_herk_matches_naive() {
         for &n in &[1usize, 7, 31, 64, 257] {
             for &r in &[1usize, 3, 12, 30] {
@@ -1828,8 +2321,11 @@ mod tests {
                     let mut s = MorphScratch::default();
                     let mut out = vec![0u8; n];
                     extreme_1d_into(&src, r, is_max, &mut s, &mut out);
-                    assert_eq!(out, naive_extreme_1d(&src, r, is_max),
-                               "n={n} r={r} is_max={is_max}");
+                    assert_eq!(
+                        out,
+                        naive_extreme_1d(&src, r, is_max),
+                        "n={n} r={r} is_max={is_max}"
+                    );
                 }
             }
         }
@@ -1869,8 +2365,11 @@ mod tests {
         let row_op = |img: &[u8], iw: usize, ih: usize, is_max: bool| -> Vec<u8> {
             let mut out = vec![0u8; iw * ih];
             for y in 0..ih {
-                out[y * iw..y * iw + iw]
-                    .copy_from_slice(&naive_extreme_1d(&img[y * iw..y * iw + iw], radius, is_max));
+                out[y * iw..y * iw + iw].copy_from_slice(&naive_extreme_1d(
+                    &img[y * iw..y * iw + iw],
+                    radius,
+                    is_max,
+                ));
             }
             out
         };
@@ -1888,15 +2387,21 @@ mod tests {
         };
         let eroded = col_op(&row_op(data, w, h, false), w, h, false);
         let opened = col_op(&row_op(&eroded, w, h, true), w, h, true);
-        data.iter().zip(opened.iter()).map(|(&a, &b)| a.saturating_sub(b)).collect()
+        data.iter()
+            .zip(opened.iter())
+            .map(|(&a, &b)| a.saturating_sub(b))
+            .collect()
     }
 
     #[test]
     fn tophat_fused_matches_reference() {
         for &(w, h, r) in &[(64usize, 48usize, 5usize), (95, 33, 12), (40, 40, 3)] {
             let img = lcg_image(w, h, (w + h + r) as u64);
-            assert_eq!(white_tophat(&img, w, h, r), reference_tophat(&img, w, h, r),
-                       "{w}x{h} r={r}");
+            assert_eq!(
+                white_tophat(&img, w, h, r),
+                reference_tophat(&img, w, h, r),
+                "{w}x{h} r={r}"
+            );
         }
     }
 
@@ -1952,14 +2457,20 @@ mod tests {
                         let m10 = meds[by0 * nx + bx1] as f32;
                         let m01 = meds[by1 * nx + bx0] as f32;
                         let m11 = meds[by1 * nx + bx1] as f32;
-                        let bg = m00 * (1.0 - fx) * (1.0 - fy) + m10 * fx * (1.0 - fy)
-                            + m01 * (1.0 - fx) * fy + m11 * fx * fy;
+                        let bg = m00 * (1.0 - fx) * (1.0 - fy)
+                            + m10 * fx * (1.0 - fy)
+                            + m01 * (1.0 - fx) * fy
+                            + m11 * fx * fy;
                         out[y * w + x] = img[y * w + x].saturating_sub(bg as u8);
                     }
                 }
                 out
             };
-            assert_eq!(block_percentile_bg(&img, w, h, bs), bg_ref, "{w}x{h} bs={bs}");
+            assert_eq!(
+                block_percentile_bg(&img, w, h, bs),
+                bg_ref,
+                "{w}x{h} bs={bs}"
+            );
         }
     }
 }
