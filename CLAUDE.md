@@ -73,11 +73,14 @@ These were debated and chosen for reasons. Ask before reverting any of them.
    in the downstream diofinder app.
 
 7. **Single 1-D gate: matched filter.** Standard signal-detection
-   construction: convolve the 7-pixel window with a Gaussian-shaped kernel
-   (sigma=1.5, calibrated against HQ Camera typical PSF) and threshold the
-   response against `sigma * noise * ||k||_2`. Implementation is integer
+   construction: convolve the window with a Gaussian-shaped kernel and threshold
+   the response against `sigma * noise * ||k||_2`. Implementation is integer
    arithmetic; mean-zero kernel cancels DC, so no per-pixel bg subtraction
-   is required.
+   is required. Since v0.12.0 the kernel is generated at runtime from
+   `kernel_sigma` (default 1.5, range 1.0–4.0); the default reproduces the
+   historical hardcoded `[-50,-15,35,60,35,-15,-50]` kernel exactly (and pins
+   the threshold norm to 107.0), so default behavior is unchanged. Larger
+   `kernel_sigma` widens the kernel (7→15 taps) for bloated PSFs.
 
    **Empirical behavior**: somewhat conservative on real-sky frames
    because the threshold derivation assumes pure Gaussian noise but
@@ -103,11 +106,15 @@ These were debated and chosen for reasons. Ask before reverting any of them.
   algorithm as tetra3rs's `estimate_local_background`. Also added
   `column_percentile` and `row_column_percentile` (separable 2-D removal) and
   parallelised the `transpose` helper used by `white_tophat`.
-- **No full 2-D moment computation in `gate_2d`.** The current `max_axis_ratio`
-  filter derives a coarse axis ratio from separable projections; it can't see
-  diagonally-elongated trails as cleanly as olive-solve's eigendecomposition.
-  For a static-FOV finder this is acceptable. Don't change it without a
-  concrete failure case.
+- **Full 2-D moment computation in `gate_2d` (added in v0.12.0).** The concrete
+  failure case arrived: diagonal satellite/aircraft trails in a finder that now
+  enables `max_axis_ratio`. The old separable var_x/var_y-only axis ratio is
+  blind to diagonal elongation (a 45° streak can have var_x ≈ var_y yet a huge
+  off-diagonal moment). When `max_axis_ratio` is finite, `gate_2d` now computes
+  the off-diagonal moment `m2_xy` in one extra 2-D pass over the per-blob box and
+  rejects on `sqrt(λ_max/λ_min)` of the full 2×2 covariance (closed-form
+  eigenvalues, `cov2x2_axis_ratio2`). The pass is skipped when `max_axis_ratio`
+  is infinite (the default), so the clean-sky hot path is unchanged.
 - **No 16-bit pixel path.** The finder explicitly works in `u8`. Olive-solve
   has `u16`/`f32` paths if you ever need them; `star_detect` does not and
   shouldn't.
@@ -140,28 +147,40 @@ star_detect.set_num_threads(2)
 stars = star_detect.detect_stars(
     image_u8,                  # 2-D C-contiguous numpy uint8 (H, W)
     sigma=8.0,                 # threshold in noise sigmas
-    bin=2,                     # 1=full-res, 2=2x2-binned detection
-    centroid_full_res=True,    # if bin=2, centroid on full-res image
+    bin=2,                     # 1=full-res, 2 or 4 = 2x2 / 4x4-binned detection
+    centroid_full_res=True,    # if bin>1, centroid on full-res image
     bg_mode="row_percentile",  # "line_median", "top_hat", "column_percentile",
                                # "row_column_percentile", "block_percentile",
                                # "uniform_mean"
-    max_axis_ratio=4.0,        # reject trails; default inf
+    max_axis_ratio=4.0,        # reject trails (full 2-D moments); default inf
     use_neon=False,            # explicit NEON prefilter (autovec is usually fine)
+    kernel_sigma=1.5,          # matched-filter kernel width, 1.0-4.0 (1.5=legacy)
+    local_noise=True,          # inflate per-blob noise to ring spread (A/B: False)
 )
 # -> [(x, y, brightness, peak), ...] brightest-first, (0.5, 0.5)=center of pixel (0,0)
 
-# Steady-state cached detection (requires pre-computed background).
+# Steady-state cached detection. Supply EXACTLY ONE of row_offsets / block_offsets.
 stars = star_detect.detect_stars_with_cache(
     image_u8,
-    row_offsets_u8,             # 1-D uint8, len == image height // bin
+    row_offsets_u8,             # 1-D uint8, len == image height // bin (positional)
     noise=2.5,                  # precomputed sigma
     sigma=8.0,
-    bin=2,
+    bin=2,                      # 1, 2, or 4
     max_axis_ratio=4.0,
+    kernel_sigma=1.5,
+    local_noise=True,
+)
+# 2-D cached background variant (keyword-only block_offsets, mutually exclusive
+# with row_offsets):
+stars = star_detect.detect_stars_with_cache(
+    image_u8, None, 2.5, bin=2,
+    block_offsets=grid_u8,      # 2-D uint8 (grid_h, grid_w) from compute_block_medians_py
+    block_size=32,
 )
 
-# Helper for the background worker: per-row median, parallel-histogram backed.
-medians = star_detect.compute_row_medians_py(image_u8)
+# Background-worker helpers (parallel-histogram backed):
+medians = star_detect.compute_row_medians_py(image_u8)        # 1-D per-row median
+grid    = star_detect.compute_block_medians_py(image_u8, 32)  # 2-D per-tile medians
 ```
 
 ## How to build

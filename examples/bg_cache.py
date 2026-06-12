@@ -1,10 +1,16 @@
 """
 Background cache + state machine for the finder.
 
-Maintains a temporally-averaged row-offset background model + noise sigma in a
-worker thread, publishes it atomically, and exposes:
+Maintains a temporally-averaged background model + noise sigma in a worker
+thread, publishes it atomically, and exposes:
 
     cache.detect(image_u8, sigma=8.0, max_axis_ratio=4.0, ...)
+
+The model is either a 1-D per-row floor (``model="row"``, default; cheapest,
+vertical gradients) or a 2-D per-tile median grid (``model="block"``, added
+with star_detect v0.12; non-separable 2-D gradients — moon glow, light
+pollution). The block variant is the first time 2-D background correction
+composes with the temporal cache.
 
 which routes to either:
   - star_detect.detect_stars_with_cache(...)  when the cache is fresh (STEADY)
@@ -46,14 +52,21 @@ class CacheState(Enum):
 
 @dataclass(frozen=True)
 class BgModel:
-    """Snapshot of the cached background. Frozen so swaps are atomic."""
-    row_offsets: np.ndarray   # uint8, shape (h_det,)
+    """Snapshot of the cached background. Frozen so swaps are atomic.
+
+    Carries EITHER a 1-D per-row floor (``row_offsets``) OR a 2-D per-tile
+    median grid (``block_offsets``), depending on the cache's ``model`` mode.
+    The unused one is None.
+    """
     noise: float              # scalar pixel units
     h: int                    # full-res image height that produced it
     w: int                    # full-res image width that produced it
-    bin: int                  # 1 or 2; row_offsets length = h // bin
+    bin: int                  # 1, 2, or 4; det image = h // bin rows
     epoch: float              # time.monotonic() when built
     n_frames: int             # how many frames went into the temporal stack
+    row_offsets: Optional[np.ndarray] = None    # uint8 (h_det,) — row model
+    block_offsets: Optional[np.ndarray] = None  # uint8 (grid_h, grid_w) — block model
+    block_size: int = 32                        # tile size for the block model
     pose_quat: Optional[Tuple[float, float, float, float]] = None
 
 
@@ -71,8 +84,14 @@ class BackgroundCache:
         refresh_interval_s: float = 5.0,
         slew_threshold_deg: float = 0.5,
         max_age_s: float = 60.0,
+        model: str = "row",       # "row" (1-D per-row floor) or "block" (2-D grid)
+        block_size: int = 32,     # tile size for the block model (bin=2 default)
     ):
+        if model not in ("row", "block"):
+            raise ValueError("model must be 'row' or 'block'")
         self.bin = bin
+        self.model = model
+        self.block_size = block_size
         self.stack_size = stack_size
         self.refresh_interval_s = refresh_interval_s
         self.slew_threshold_deg = math.radians(slew_threshold_deg)
@@ -163,6 +182,20 @@ class BackgroundCache:
         m = self._model
         if st is CacheState.STEADY and m is not None and m.h == image_u8.shape[0] \
                 and m.w == image_u8.shape[1] and m.bin == self.bin:
+            if m.block_offsets is not None:
+                # 2-D block-grid cached path: composes the temporal cache with
+                # non-separable 2-D background removal. row_offsets stays None.
+                return star_detect.detect_stars_with_cache(
+                    image_u8,
+                    None,
+                    m.noise,
+                    sigma=sigma,
+                    bin=self.bin,
+                    use_neon=use_neon,
+                    max_axis_ratio=max_axis_ratio,
+                    block_offsets=m.block_offsets,
+                    block_size=m.block_size,
+                )
             return star_detect.detect_stars_with_cache(
                 image_u8,
                 m.row_offsets,
@@ -249,8 +282,18 @@ class BackgroundCache:
         else:
             h_det, w_det = h, w
 
-        # 3. Per-row median via the native helper (parallel histograms).
-        row_offsets = star_detect.compute_row_medians_py(time_med)
+        # 3. Background model from the native helper (parallel histograms).
+        #    "row":   1-D per-row median floor (cheap; vertical gradients).
+        #    "block": 2-D per-tile median grid (non-separable 2-D gradients;
+        #             composes 2-D background correction with the temporal cache).
+        if self.model == "block":
+            row_offsets = None
+            block_offsets = star_detect.compute_block_medians_py(
+                time_med, block_size=self.block_size
+            )
+        else:
+            row_offsets = star_detect.compute_row_medians_py(time_med)
+            block_offsets = None
 
         # 4. Noise sigma: MAD on a dark patch in the middle quarter.
         patch = time_med[h_det // 3 : 2 * h_det // 3, w_det // 3 : 2 * w_det // 3]
@@ -261,6 +304,8 @@ class BackgroundCache:
 
         return BgModel(
             row_offsets=row_offsets,
+            block_offsets=block_offsets,
+            block_size=self.block_size,
             noise=noise,
             h=h, w=w, bin=self.bin,
             epoch=time.monotonic(),

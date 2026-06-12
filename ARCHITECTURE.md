@@ -102,21 +102,28 @@ This would be simpler but defeats the entire point. Continuous rebuild = work
 per frame = no different from olive-solve. The "build only when steady"
 property is the lever.
 
-### Rejected: full 2-D BlockMedian background instead of row offsets
+### Implemented in v0.12.0: full 2-D block-grid background in the cache
 
-The current cached model is per-row. A 2-D background map (e.g. 32×24 grid,
-bilinearly interpolated) would handle horizontal as well as vertical
-gradients. Reasons we don't yet:
+Originally deferred (this section used to read "Rejected"). The cached model
+was per-row; a 2-D background map handles horizontal as well as vertical
+gradients. As predicted, the cache API grew to include a 2-D map *alongside*
+the per-row offsets without breaking the existing call shape:
 
-- For an IMX477 with a typical finder lens, the vignetting is primarily
-  radial but the worst component is still vertical (the LineMedian model
-  catches most of it).
-- BlockMedian doubles the worker complexity (grid + interpolation) and the
-  detection hot path needs to interpolate two grid neighbors per pixel
-  instead of indexing one array.
-- It's a clear next step if data shows it's needed. The cache API can grow
-  to include a 2-D map alongside the per-row offsets without breaking the
-  existing call shape.
+- `compute_block_medians_py(image, block_size)` returns a 2-D uint8 grid of
+  per-tile medians (the worker's 2-D analogue of `compute_row_medians_py`),
+  reusing the per-frame `block_percentile` tile-median internals.
+- `detect_stars_with_cache` accepts the cache as either `row_offsets` (1-D,
+  positional, unchanged) **or** keyword-only `block_offsets` (the grid) +
+  `block_size`. Exactly one must be supplied. The block path subtracts the
+  bilinearly-interpolated grid (the same `subtract_block_grid` the per-frame
+  mode uses) then runs the standard scan with the inline row-percentile floor.
+
+The original reservations still inform when to use it: for an IMX477 with a
+typical finder lens the dominant vignetting component is vertical, so the
+cheaper per-row model is the default; reach for the block grid when the
+gradient is genuinely 2-D (light pollution, moon glow, off-axis sky-glow).
+The block path costs a per-pixel bilinear interpolation of four grid
+neighbors versus a single array index for the row path.
 
 ### Rejected: pure dark-frame subtraction
 
@@ -182,11 +189,20 @@ uniform-background sanity checks. Battle-tested across years of real-sky
 frames in the PiFinder ecosystem.
 
 **`matched_filter`** is the standard signal-detection construction:
-convolve the 7-pixel window with a discrete Gaussian kernel (sigma=1.5,
-FWHM ~3.5 px), threshold against `sigma * noise * kernel_L2_norm`.
-Mathematically the optimal *linear* detector for a known-shape pulse in
-additive Gaussian white noise (North 1943, Turin 1960, Van Trees 1968).
-Independently derived; not inherited from cedar.
+convolve the window with a discrete Gaussian kernel, threshold against
+`sigma * noise * kernel_L2_norm`. Mathematically the optimal *linear*
+detector for a known-shape pulse in additive Gaussian white noise
+(North 1943, Turin 1960, Van Trees 1968). Independently derived; not
+inherited from cedar.
+
+Since v0.12.0 the kernel is generated at runtime from `kernel_sigma`
+(default 1.5 → the original 7-tap `[-50,-15,35,60,35,-15,-50]`, FWHM ~3.5 px,
+reproduced bit-identically with the threshold norm pinned to 107.0). Half-width
+is `ceil(2*sigma)` clamped to [3,7], so sigma 1.0–4.0 spans 7–15 taps; the
+kernel is mean-subtracted (DC-free), its center coefficient rounds to 60, and
+any rounding residual is removed by a symmetric adjustment of the outermost
+taps so the taps sum to exactly zero. Widening the kernel matches bloated PSFs
+(poor seeing, heavy defocus) that the tight default under-detects.
 
 ### Why both exist
 

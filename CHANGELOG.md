@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.12.0
+
+Robustness across seeing conditions (bloated PSFs, 2-D gradients, trails) for
+the downstream diofinder finder. Five additive features; **default-parameter
+behavior is unchanged and bit-identical to 0.11.x** (verified by comparing the
+0.11.2 and 0.12.0 wheels on synthetic frames: row_percentile / line_median /
+block_percentile outputs match exactly under a canonical sort). New costs are
+gated behind non-default parameters only.
+
+### Added
+- **Runtime-tunable matched-filter kernel** via `kernel_sigma` (float, default
+  1.5, valid range 1.0–4.0, ValueError outside) on `detect_stars` and
+  `detect_stars_with_cache`. The integer Gaussian kernel is generated at runtime
+  (half-width `ceil(2*sigma)` clamped to [3,7] → 7/9/11/13/15 taps; mean-
+  subtracted; center coeff rounds to 60; sum forced to 0 by a symmetric residual
+  adjustment on the outermost taps). `kernel_sigma=1.5` reproduces the historical
+  hardcoded kernel `[-50,-15,35,60,35,-15,-50]` exactly (unit-tested), and its
+  threshold L2 norm is pinned to 107.0 so default results don't shift; wider
+  kernels use their true ||k||₂. Widen the kernel for bloated PSFs from poor
+  seeing or heavy defocus.
+- **Full 2-D second-moment trail rejection.** When `max_axis_ratio` is finite,
+  `gate_2d` now computes the off-diagonal moment `m2_xy` (one extra 2-D pass
+  over the per-blob box) and rejects on `sqrt(λ_max/λ_min)` of the full 2×2
+  covariance. This catches *diagonally*-elongated satellite/aircraft trails the
+  old separable var_x/var_y-only approximation could not see. Skipped entirely
+  when `max_axis_ratio` is infinite (the default), so the hot path is unchanged.
+- **Perimeter-derived local noise inflation** (concept inspired by cedar-detect,
+  Apache-2.0; independent implementation, no code copied). The per-blob
+  acceptance test now uses `effective_noise = max(global_noise, ring_spread)`,
+  where `ring_spread` is the stddev of the blob's perimeter ring. This raises
+  the detection bar in cluttered/noisy neighborhoods (moon halo, clouds,
+  foreground glow) and suppresses false positives there; on clean sky
+  `ring_spread < global noise` so behavior is unchanged. New `local_noise` bool
+  (default True) on both entry points disables it for A/B testing. Applied at
+  the 2-D stage only — the 1-D scan is untouched.
+- **`bin=4`** on `detect_stars` and `detect_stars_with_cache`: two cascaded 2×2
+  mean bins (the escape hatch for badly defocused / oversampled stars). With
+  `centroid_full_res=True`, centroids are taken on the full-res image with
+  coordinates mapped ×4; noise/background estimation runs on the binned image.
+- **2-D block-grid temporal cache.** New `compute_block_medians_py(image,
+  block_size=32) -> (grid_h, grid_w) uint8` returns the per-tile median grid
+  (reusing the `block_percentile` internals). `detect_stars_with_cache` now
+  accepts the cache as either `row_offsets` (1-D, positional, backward-
+  compatible) **or** a keyword-only `block_offsets` (2-D grid) + `block_size`;
+  exactly one must be supplied (ValueError otherwise). The block path subtracts
+  the bilinearly-interpolated 2-D background then runs the standard scan with the
+  inline row-percentile floor — making 2-D background correction compose with
+  the temporal cache for the first time (the "rejected: full 2-D BlockMedian
+  cache" item in ARCHITECTURE.md is now implemented). `examples/bg_cache.py`
+  gained a `model="block"` variant.
+
+### Notes
+- The block-cache path produces output bit-identical to per-frame
+  `bg_mode="block_percentile"` on a static frame with the same grid + noise
+  (unit-tested at the Rust level; verified end-to-end in the Python smoke test).
+
 ## 0.11.2
 
 - Switch the Python extension to PyO3 abi3 (`abi3-py38`): one wheel now
