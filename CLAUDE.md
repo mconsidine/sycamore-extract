@@ -177,6 +177,17 @@ stars = star_detect.detect_stars_with_cache(
     block_offsets=grid_u8,      # 2-D uint8 (grid_h, grid_w) from compute_block_medians_py
     block_size=32,
 )
+# Full per-pixel cached background (v0.13.0; keyword-only bg_image, mutually
+# exclusive with row_offsets / block_offsets). bg_image is the temporal median
+# stack itself at the BINNED detection resolution (height//bin, width//bin) —
+# subtracted directly, it removes gradients, vignetting AND per-pixel
+# fixed-pattern structure in one pass. Probe getattr(star_detect,
+# "HAS_BG_IMAGE", False) before using (native fns don't support
+# inspect.signature).
+stars = star_detect.detect_stars_with_cache(
+    image_u8, None, 2.5, bin=2,
+    bg_image=med_binned_u8,     # 2-D uint8 (height//bin, width//bin)
+)
 
 # Background-worker helpers (parallel-histogram backed):
 medians = star_detect.compute_row_medians_py(image_u8)        # 1-D per-row median

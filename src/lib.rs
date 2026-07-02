@@ -616,6 +616,16 @@ fn compute_block_medians(
 
 /// Subtract a bilinearly-interpolated block-median background grid (saturating).
 /// Shared by `block_percentile_bg` (per-frame) and the cached block path.
+/// Per-pixel saturating subtraction of a full background image (same length as
+/// `data`). The bg_image cached path: the temporal median stack IS the model,
+/// so no interpolation is needed — one pass, autovectorizes on A53.
+fn subtract_image(data: &[u8], bg: &[u8]) -> Vec<u8> {
+    data.iter()
+        .zip(bg.iter())
+        .map(|(&p, &b)| p.saturating_sub(b))
+        .collect()
+}
+
 fn subtract_block_grid(
     data: &[u8],
     width: usize,
@@ -1755,7 +1765,7 @@ fn detect_stars(
 /// that is both faster and *more accurate* than per-frame estimation, because
 /// the background model was computed over temporal data.
 ///
-/// Two cached background models are supported (exactly one must be supplied):
+/// Three cached background models are supported (exactly one must be supplied):
 ///
 ///   * `row_offsets` — a 1-D per-row floor (the original cache model). Cheapest;
 ///     handles per-row offset noise and vertical gradients.
@@ -1765,6 +1775,13 @@ fn detect_stars(
 ///     pollution) — the first time 2-D background correction composes with the
 ///     temporal cache. After subtraction, detection uses the standard inline
 ///     row-percentile floor on the corrected image.
+///   * `bg_image` — the full per-pixel background at detection resolution
+///     (typically the temporal median stack itself, binned). Subtracted
+///     directly, this is the most complete model: it removes gradients,
+///     vignetting, sky-glow AND per-pixel fixed-pattern structure (warm
+///     pixels, amp glow) in one pass — everything the temporal stack knows.
+///     After subtraction, detection uses the standard inline row-percentile
+///     floor on the (near-flat) corrected image, like the block path.
 ///
 /// Args:
 ///   image:       2-D C-contiguous numpy uint8 array (height, width).
@@ -1786,8 +1803,11 @@ fn detect_stars(
 ///                using the cached row_floors. Only valid with row_offsets.
 ///                Centroids are taken on the original image. Default 0.
 ///   block_offsets: optional 2-D numpy uint8 grid of per-tile medians (keyword-
-///                only). Mutually exclusive with row_offsets.
+///                only). Mutually exclusive with row_offsets / bg_image.
 ///   block_size:  tile side length (px) that produced block_offsets (default 32).
+///   bg_image:    optional 2-D numpy uint8 per-pixel background at the binned
+///                detection resolution (height // bin, width // bin), keyword-
+///                only. Mutually exclusive with row_offsets / block_offsets.
 ///
 /// The caller is responsible for refreshing the model and noise when the scene
 /// changes (slew, moon angle shift, twilight progression).
@@ -1809,6 +1829,7 @@ fn detect_stars(
     *,
     block_offsets=None,
     block_size=32u32,
+    bg_image=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn detect_stars_with_cache(
@@ -1826,6 +1847,7 @@ fn detect_stars_with_cache(
     local_noise: bool,
     block_offsets: Option<numpy::PyReadonlyArray2<u8>>,
     block_size: u32,
+    bg_image: Option<PyReadonlyArray2<u8>>,
 ) -> PyResult<Vec<(f64, f64, f64, i64)>> {
     let shape = image.shape();
     let (h, w) = (shape[0], shape[1]);
@@ -1837,10 +1859,12 @@ fn detect_stars_with_cache(
     }
     let scale = bin as usize;
 
-    // Exactly one of row_offsets / block_offsets must be given.
-    if row_offsets.is_some() == block_offsets.is_some() {
+    // Exactly one of row_offsets / block_offsets / bg_image must be given.
+    let n_models =
+        row_offsets.is_some() as u8 + block_offsets.is_some() as u8 + bg_image.is_some() as u8;
+    if n_models != 1 {
         return Err(PyValueError::new_err(
-            "exactly one of row_offsets / block_offsets must be supplied",
+            "exactly one of row_offsets / block_offsets / bg_image must be supplied",
         ));
     }
     if !(1.0..=4.0).contains(&kernel_sigma) {
@@ -1903,9 +1927,31 @@ fn detect_stars_with_cache(
         None => None,
     };
 
-    if block_grid.is_some() && tophat_radius > 0 {
+    // Validate and copy the full per-pixel background model, if supplied. It
+    // must be at the binned detection resolution (the same space the row and
+    // block models live in).
+    let owned_bg: Option<Vec<u8>> = match &bg_image {
+        Some(bg) => {
+            let bshape = bg.shape();
+            if bshape.len() != 2 || bshape[0] != hb || bshape[1] != wb {
+                return Err(PyValueError::new_err(format!(
+                    "bg_image shape ({}, {}) does not match the binned \
+                     detection resolution ({hb}, {wb}) for bin={bin}",
+                    bshape[0],
+                    bshape.get(1).copied().unwrap_or(0),
+                )));
+            }
+            let s = bg
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("bg_image must be C-contiguous uint8"))?;
+            Some(s.to_vec())
+        }
+        None => None,
+    };
+
+    if (block_grid.is_some() || owned_bg.is_some()) && tophat_radius > 0 {
         return Err(PyValueError::new_err(
-            "tophat_radius is only supported with row_offsets, not block_offsets",
+            "tophat_radius is only supported with row_offsets",
         ));
     }
 
@@ -1954,7 +2000,31 @@ fn detect_stars_with_cache(
                     (det_src, dw, dh, 1)
                 };
 
-                let mut result = if let Some((grid, gnx, gny)) = &block_grid {
+                let mut result = if let Some(bg) = &owned_bg {
+                    // ---- Full per-pixel cached path. Subtract the temporal
+                    // background image directly (gradients, vignetting AND
+                    // fixed-pattern structure in one pass), then run the
+                    // standard detection with the inline RowPercentile floor
+                    // on the near-flat corrected image, exactly like the
+                    // block-grid path. The supplied `noise` is used.
+                    let corrected = subtract_image(det_src, bg);
+                    detect(
+                        &corrected,
+                        dw,
+                        dh,
+                        cent_img,
+                        cw,
+                        ch,
+                        cscale,
+                        sigma,
+                        noise,
+                        use_neon,
+                        BgMode::RowPercentile,
+                        max_axis_ratio,
+                        &kernel,
+                        local_noise,
+                    )
+                } else if let Some((grid, gnx, gny)) = &block_grid {
                     // ---- Block-grid cached path. Subtract the bilinearly-
                     // interpolated 2-D background, then run the standard
                     // detection with the inline RowPercentile floor (same as the
@@ -2185,6 +2255,10 @@ fn star_detect(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_row_medians_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_block_medians_py, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
+    // Capability flag for downstream probes (native functions don't support
+    // inspect.signature, so consumers check getattr(star_detect,
+    // "HAS_BG_IMAGE", False) before passing bg_image=).
+    m.add("HAS_BG_IMAGE", true)?;
     Ok(())
 }
 
@@ -2202,6 +2276,28 @@ mod tests {
                 (s >> 33) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn subtract_image_saturates_and_flattens() {
+        // A gradient background subtracted from gradient+star leaves only the
+        // star; pixels where bg >= data saturate at 0 (never wrap).
+        let w = 8usize;
+        let h = 4usize;
+        let bg: Vec<u8> = (0..w * h).map(|i| (i % w) as u8 * 10).collect();
+        let mut data = bg.clone();
+        data[2 * w + 3] = data[2 * w + 3].saturating_add(50); // the "star"
+        data[w + 1] = 0; // dead pixel below the background
+        let out = subtract_image(&data, &bg);
+        assert_eq!(out[2 * w + 3], 50);
+        assert_eq!(out[w + 1], 0); // saturated, not wrapped
+        let residue: u32 = out
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 2 * w + 3)
+            .map(|(_, &v)| v as u32)
+            .sum();
+        assert_eq!(residue, 0);
     }
 
     /// Naive O(n*r) sliding-window extreme with neutral padding — reference
