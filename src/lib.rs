@@ -2248,17 +2248,315 @@ fn compute_block_medians_py<'py>(
     Ok(numpy::PyArray2::from_owned_array_bound(py, arr))
 }
 
+// =========================================================================
+// ROI (window-list) detection — tracking-mode fast path (v0.14.0)
+// =========================================================================
+//
+// The downstream diofinder tracking mode detects stars in ~48 px windows
+// around predicted positions. Before this entry point it sliced numpy windows
+// in Python and called the detector once per window — one GIL round-trip and
+// one thread-pool entry per window. `detect_stars_roi` takes the full frame
+// plus an (N, 4) window list, copies the frame once, releases the GIL once,
+// and fans the windows out across the existing bounded rayon pool.
+//
+// Per-window pipeline (bin is always 1 — windows are far too small to bin):
+//   background: per-row true median inside the window (`line_median`; the
+//     inline cache-line-sampled row-percentile the full-frame bin=1 path uses
+//     degenerates to ~1 sample per row at window widths, so the median is the
+//     correct floor here — computed with the same `compute_row_medians` the
+//     LineMedian path uses);
+//   noise: MAD over the whole window (robust at 48x48 = 2304 px; the
+//     full-frame patch-grid estimator requires >=64 px sides);
+//   then the standard scan_band -> form_blobs -> gate_2d chain, keeping only
+//   the brightest surviving star per window.
+
+/// Minimum usable window side length (px) after clamping. Smaller windows are
+/// skipped: gate_2d needs a 3-px context ring on each side, so below ~8 px
+/// there is no interior left to detect in.
+const ROI_MIN_SIDE: usize = 8;
+
+/// Defensively clamp a caller-supplied window (x0, y0, x1, y1; x1/y1
+/// exclusive) to the image bounds. Returns None if the clamped window is
+/// degenerate (inverted, empty, or under ROI_MIN_SIDE on either side).
+fn clamp_window(
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    w: usize,
+    h: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let cx0 = x0.clamp(0, w as i64) as usize;
+    let cy0 = y0.clamp(0, h as i64) as usize;
+    let cx1 = x1.clamp(0, w as i64) as usize;
+    let cy1 = y1.clamp(0, h as i64) as usize;
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return None;
+    }
+    if cx1 - cx0 < ROI_MIN_SIDE || cy1 - cy0 < ROI_MIN_SIDE {
+        return None;
+    }
+    Some((cx0, cy0, cx1, cy1))
+}
+
+/// MAD noise estimate over an entire (small) buffer: 1.4826 * median(|x -
+/// median(x)|), floored at 0.5. The window analogue of the patch-based
+/// `estimate_noise` (which needs >=64 px sides and would return the floor for
+/// every tracking window). Two O(n) histogram passes, no allocation.
+fn estimate_noise_mad_window(data: &[u8]) -> f64 {
+    const MIN_NOISE: f64 = 0.5;
+    let n = data.len();
+    if n == 0 {
+        return MIN_NOISE;
+    }
+    let mut hist = [0u32; 256];
+    for &p in data {
+        hist[p as usize] += 1;
+    }
+    let target = (n as u32).div_ceil(2);
+    let mut acc = 0u32;
+    let mut median = 0u8;
+    for (v, &c) in hist.iter().enumerate() {
+        acc += c;
+        if acc >= target {
+            median = v as u8;
+            break;
+        }
+    }
+    let mut dhist = [0u32; 256];
+    for &p in data {
+        dhist[(p as i32 - median as i32).unsigned_abs() as usize] += 1;
+    }
+    acc = 0;
+    let mut mad = 0u8;
+    for (v, &c) in dhist.iter().enumerate() {
+        acc += c;
+        if acc >= target {
+            mad = v as u8;
+            break;
+        }
+    }
+    (1.4826 * mad as f64).max(MIN_NOISE)
+}
+
+/// Detect the single brightest star in one contiguous window buffer
+/// (window-local coordinates; the caller adds the window offset back).
+/// Reuses the full-frame internals: `compute_row_medians` (line_median floor),
+/// `scan_band`, `form_blobs`, `gate_2d` at scale 1 (bin=1, detection image ==
+/// centroid image). Returns None when nothing passes the gates.
+fn detect_roi_window(
+    win: &[u8],
+    ww: usize,
+    wh: usize,
+    sigma: f64,
+    kernel: &MatchedKernel,
+    local_noise: bool,
+    max_axis_ratio: f64,
+) -> Option<Star> {
+    // The gate window must fit inside the row (wide kernels need more width).
+    if ww < 2 * kernel.half + 1 || wh < 7 {
+        return None;
+    }
+    let noise = estimate_noise_mad_window(win);
+    let sn2 = ((2.0 * sigma * noise + 0.5) as i32).max(2);
+    let mf_thresh = mf_threshold(sigma, noise, kernel);
+    let floors = compute_row_medians(win, ww, wh);
+    let cands = scan_band(win, ww, 0, wh, sn2, false, Some(&floors), kernel, mf_thresh);
+    if cands.is_empty() {
+        return None;
+    }
+    // Extended-object cap. The full-frame formula (det_w/100) would give the
+    // 3-px minimum for any window and reject a bright bin=1 star whose blob
+    // spans ~5 rows, so scale with the window instead: a point source in a
+    // tracking window is comfortably under a quarter of the window side.
+    let max_size = (ww.max(wh) / 4).max(3);
+    let blobs = form_blobs(&cands, wh);
+    let mut best: Option<Star> = None;
+    for blob in &blobs {
+        if let Some(s) = gate_2d(
+            &cands,
+            blob,
+            win,
+            ww,
+            wh,
+            win,
+            ww,
+            wh,
+            1,
+            noise,
+            sigma,
+            local_noise,
+            max_size,
+            max_axis_ratio,
+        ) {
+            if best.as_ref().is_none_or(|b| s.brightness > b.brightness) {
+                best = Some(s);
+            }
+        }
+    }
+    best
+}
+
+/// Extract an (N, 4) int32 or int64 numpy window list into Vec<[i64; 4]>.
+fn extract_windows_array(windows: &Bound<'_, PyAny>) -> PyResult<Vec<[i64; 4]>> {
+    fn rows<T: Copy + Into<i64>>(s: &[T]) -> Vec<[i64; 4]> {
+        s.chunks_exact(4)
+            .map(|c| [c[0].into(), c[1].into(), c[2].into(), c[3].into()])
+            .collect()
+    }
+    if let Ok(a) = windows.extract::<numpy::PyReadonlyArray2<i64>>() {
+        if a.shape()[1] != 4 {
+            return Err(PyValueError::new_err(
+                "windows must have shape (N, 4): x0, y0, x1, y1 (exclusive)",
+            ));
+        }
+        let s = a
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("windows must be C-contiguous"))?;
+        return Ok(rows(s));
+    }
+    if let Ok(a) = windows.extract::<numpy::PyReadonlyArray2<i32>>() {
+        if a.shape()[1] != 4 {
+            return Err(PyValueError::new_err(
+                "windows must have shape (N, 4): x0, y0, x1, y1 (exclusive)",
+            ));
+        }
+        let s = a
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("windows must be C-contiguous"))?;
+        return Ok(rows(s));
+    }
+    Err(PyValueError::new_err(
+        "windows must be a 2-D numpy int32 or int64 array of shape (N, 4): \
+         x0, y0, x1, y1 (exclusive)",
+    ))
+}
+
+/// Detect stars in N small windows of a full frame with ONE call.
+///
+/// The tracking-mode fast path: instead of slicing numpy windows in Python and
+/// calling `detect_stars` once per window (one GIL round-trip each), pass the
+/// full frame plus the window list. The frame is copied once, the GIL is
+/// released once, and the windows fan out across the bounded thread pool.
+///
+/// Args:
+///   image:   2-D C-contiguous numpy uint8 array (height, width) — the FULL
+///            frame, not pre-sliced windows.
+///   windows: 2-D numpy int32 or int64 array of shape (N, 4), each row
+///            (x0, y0, x1, y1) with x1/y1 EXCLUSIVE. Windows are defensively
+///            re-clamped to the image bounds; windows degenerate after
+///            clamping (< 8 px on a side, inverted, or empty) are skipped.
+///   sigma:   detection threshold in noise sigmas (same as detect_stars;
+///            values below 0.5 are clamped to 0.5).
+///   kernel_sigma: matched-filter kernel width, 1.0-4.0 (same as detect_stars).
+///   local_noise:  same as detect_stars.
+///   max_axis_ratio: same semantics as detect_stars (default Inf = off).
+///
+/// Per-window pipeline (bin is always 1 — a 48-px window must not be binned):
+/// per-row median background floor (line_median), whole-window MAD noise,
+/// then the standard matched-filter gate / blob / 2-D gate chain. At most ONE
+/// star — the brightest surviving detection — is returned per window.
+///
+/// Probe `getattr(star_detect, "HAS_ROI", False)` before calling (native
+/// functions don't support inspect.signature).
+///
+/// Returns: list of (x, y, brightness, peak), brightest first, in FULL-FRAME
+///          coordinates (window offset added back); (0.5, 0.5) is the center
+///          of the frame's top-left pixel, exactly as detect_stars.
+#[pyfunction]
+#[pyo3(signature = (
+    image,
+    windows,
+    sigma=8.0,
+    kernel_sigma=1.5,
+    local_noise=true,
+    max_axis_ratio=f64::INFINITY,
+))]
+fn detect_stars_roi(
+    py: Python<'_>,
+    image: PyReadonlyArray2<u8>,
+    windows: &Bound<'_, PyAny>,
+    sigma: f64,
+    kernel_sigma: f64,
+    local_noise: bool,
+    max_axis_ratio: f64,
+) -> PyResult<Vec<(f64, f64, f64, i64)>> {
+    let shape = image.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("image must be 2-D"));
+    }
+    let (h, w) = (shape[0], shape[1]);
+
+    let win_list = extract_windows_array(windows)?;
+
+    if !(1.0..=4.0).contains(&kernel_sigma) {
+        return Err(PyValueError::new_err(format!(
+            "kernel_sigma must be in [1.0, 4.0]; got {kernel_sigma}"
+        )));
+    }
+    let kernel = generate_matched_kernel(kernel_sigma);
+    let sigma = sigma.max(0.5);
+
+    // Copy the image once so we can drop the GIL (the existing pattern).
+    let owned: Vec<u8> = image
+        .as_slice()
+        .map_err(|_| {
+            PyValueError::new_err("image must be C-contiguous uint8; use np.ascontiguousarray")
+        })?
+        .to_vec();
+
+    let mut stars: Vec<Star> = py.allow_threads(|| {
+        let pool = get_pool();
+        pool.install(|| {
+            win_list
+                .par_iter()
+                .filter_map(|&[x0, y0, x1, y1]| {
+                    let (cx0, cy0, cx1, cy1) = clamp_window(x0, y0, x1, y1, w, h)?;
+                    let ww = cx1 - cx0;
+                    let wh = cy1 - cy0;
+                    // Contiguous window copy (a few KB; keeps the row math of
+                    // the shared internals simple and cache-friendly).
+                    let mut win = Vec::with_capacity(ww * wh);
+                    for y in cy0..cy1 {
+                        win.extend_from_slice(&owned[y * w + cx0..y * w + cx1]);
+                    }
+                    detect_roi_window(&win, ww, wh, sigma, &kernel, local_noise, max_axis_ratio)
+                        .map(|s| Star {
+                            x: s.x + cx0 as f64,
+                            y: s.y + cy0 as f64,
+                            ..s
+                        })
+                })
+                .collect()
+        })
+    });
+
+    stars.sort_by(|a, b| {
+        b.brightness
+            .partial_cmp(&a.brightness)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    Ok(stars
+        .into_iter()
+        .map(|s| (s.x, s.y, s.brightness, s.peak as i64))
+        .collect())
+}
+
 #[pymodule]
 fn star_detect(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_stars, m)?)?;
     m.add_function(wrap_pyfunction!(detect_stars_with_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_stars_roi, m)?)?;
     m.add_function(wrap_pyfunction!(compute_row_medians_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_block_medians_py, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
-    // Capability flag for downstream probes (native functions don't support
+    // Capability flags for downstream probes (native functions don't support
     // inspect.signature, so consumers check getattr(star_detect,
-    // "HAS_BG_IMAGE", False) before passing bg_image=).
+    // "HAS_BG_IMAGE", False) before passing bg_image=, and
+    // getattr(star_detect, "HAS_ROI", False) before calling detect_stars_roi).
     m.add("HAS_BG_IMAGE", true)?;
+    m.add("HAS_ROI", true)?;
     Ok(())
 }
 
@@ -2276,6 +2574,103 @@ mod tests {
                 (s >> 33) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn clamp_window_defensive() {
+        // In-bounds window passes through unchanged.
+        assert_eq!(
+            clamp_window(10, 20, 58, 68, 400, 300),
+            Some((10, 20, 58, 68))
+        );
+        // Out-of-bounds coordinates are clamped to the image, not rejected,
+        // as long as >= ROI_MIN_SIDE survives on each side.
+        assert_eq!(
+            clamp_window(-20, -5, 30, 40, 400, 300),
+            Some((0, 0, 30, 40))
+        );
+        assert_eq!(
+            clamp_window(380, 280, 500, 500, 400, 300),
+            Some((380, 280, 400, 300))
+        );
+        // Degenerate after clamping (< ROI_MIN_SIDE on a side): skipped.
+        assert_eq!(clamp_window(395, 0, 500, 48, 400, 300), None); // 5 px wide
+        assert_eq!(clamp_window(0, 0, 48, 7, 400, 300), None); // 7 px tall
+
+        // Inverted / empty / fully outside: skipped.
+        assert_eq!(clamp_window(50, 50, 10, 90, 400, 300), None);
+        assert_eq!(clamp_window(50, 50, 50, 90, 400, 300), None);
+        assert_eq!(clamp_window(500, 500, 600, 600, 400, 300), None);
+        assert_eq!(clamp_window(-100, -100, -10, -10, 400, 300), None);
+    }
+
+    #[test]
+    fn mad_window_noise_estimate() {
+        // Flat window: MAD = 0 -> floored at 0.5.
+        assert_eq!(estimate_noise_mad_window(&vec![20u8; 48 * 48]), 0.5);
+        assert_eq!(estimate_noise_mad_window(&[]), 0.5);
+        // Equal thirds of {16, 20, 24}: median = 20, deviations are 0 (1/3)
+        // and 4 (2/3), so MAD = 4 -> 1.4826 * 4.
+        let alt: Vec<u8> = (0..48 * 48).map(|i| 16 + 4 * (i % 3) as u8).collect();
+        let n = estimate_noise_mad_window(&alt);
+        assert!((n - 1.4826 * 4.0).abs() < 1e-9, "n = {n}");
+    }
+
+    /// Synthetic Gaussian star on a flat background, window-local coords.
+    fn star_window(ww: usize, wh: usize, bg: u8, cx: f64, cy: f64, amp: f64, psf: f64) -> Vec<u8> {
+        (0..ww * wh)
+            .map(|i| {
+                let x = (i % ww) as f64;
+                let y = (i / ww) as f64;
+                let d2 = (x - cx).powi(2) + (y - cy).powi(2);
+                let v = bg as f64 + amp * (-d2 / (2.0 * psf * psf)).exp();
+                v.round().clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn roi_window_finds_single_star() {
+        let kernel = generate_matched_kernel(1.5);
+        // Star centered on pixel (24, 24) -> expected centroid (24.5, 24.5)
+        // in the (0.5, 0.5)-center-of-pixel convention.
+        let win = star_window(48, 48, 20, 24.0, 24.0, 130.0, 1.0);
+        let s = detect_roi_window(&win, 48, 48, 8.0, &kernel, true, f64::INFINITY)
+            .expect("bright star must be detected");
+        assert!((s.x - 24.5).abs() < 0.5, "x = {}", s.x);
+        assert!((s.y - 24.5).abs() < 0.5, "y = {}", s.y);
+        assert!(s.peak >= 140);
+    }
+
+    #[test]
+    fn roi_window_empty_returns_none() {
+        let kernel = generate_matched_kernel(1.5);
+        // Flat background: nothing to detect.
+        let win = vec![20u8; 48 * 48];
+        assert!(detect_roi_window(&win, 48, 48, 8.0, &kernel, true, f64::INFINITY).is_none());
+        // Too narrow for the gate window: skipped, not panicking.
+        assert!(
+            detect_roi_window(&win[..6 * 48], 6, 48, 8.0, &kernel, true, f64::INFINITY).is_none()
+        );
+    }
+
+    #[test]
+    fn roi_window_picks_brightest_of_two() {
+        let kernel = generate_matched_kernel(1.5);
+        // Two well-separated stars in one window; only the brighter returns.
+        let mut win = star_window(48, 48, 20, 14.0, 14.0, 130.0, 1.0);
+        let faint = star_window(48, 48, 0, 34.0, 34.0, 60.0, 1.0);
+        for (w, f) in win.iter_mut().zip(faint.iter()) {
+            *w = w.saturating_add(*f);
+        }
+        let s = detect_roi_window(&win, 48, 48, 8.0, &kernel, true, f64::INFINITY)
+            .expect("must detect");
+        assert!(
+            (s.x - 14.5).abs() < 0.5 && (s.y - 14.5).abs() < 0.5,
+            "picked ({}, {})",
+            s.x,
+            s.y
+        );
     }
 
     #[test]

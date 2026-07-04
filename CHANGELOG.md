@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.14.0
+
+### Added
+- **ROI detection API: `detect_stars_roi(image, windows, sigma=8.0,
+  kernel_sigma=1.5, local_noise=True, max_axis_ratio=inf)`** — the
+  tracking-mode fast path. Takes the FULL frame plus a 2-D numpy int32/int64
+  window list of shape (N, 4) (`x0, y0, x1, y1`, exclusive) and detects stars
+  in all N windows with ONE call: the frame is copied once, the GIL is
+  released once, and the windows fan out across the existing bounded rayon
+  pool (previously the downstream diofinder tracking mode sliced numpy
+  windows in Python and paid one GIL round-trip per window). Windows are
+  defensively re-clamped to the image bounds; windows degenerate after
+  clamping (< 8 px on a side, inverted, or empty) are skipped. Per-window
+  pipeline is always bin=1: per-row median background floor (`line_median` —
+  the inline cache-line-sampled row percentile degenerates at ~48 px widths),
+  whole-window MAD noise (the patch-grid estimator needs ≥ 64 px sides), then
+  the standard matched-filter gate / blob / 2-D gate chain, reusing the
+  full-frame internals. Returns at most ONE star per window (the brightest
+  surviving detection), `[(x, y, brightness, peak), ...]` brightest-first in
+  FULL-FRAME coordinates with the usual (0.5, 0.5)-center-of-pixel
+  convention.
+- **`HAS_ROI = True` capability flag** (module-level, next to
+  `HAS_BG_IMAGE`) — probe `getattr(star_detect, "HAS_ROI", False)` before
+  calling, per the consumer contract (native functions defeat
+  `inspect.signature`).
+- Off-device validation in `tests/test_roi.py` (pytest, synthetic frames):
+  full-frame coordinate mapping within 1 px of truth, empty windows return
+  nothing, out-of-bounds windows clamp without panicking, int32/int64 window
+  arrays both accepted, one-star-per-window cap.
+
+## 0.13.0
+
+*(entry backfilled — this release shipped without a changelog entry)*
+
+### Added
+- **`bg_image` cached background** for `detect_stars_with_cache`
+  (keyword-only, mutually exclusive with `row_offsets` / `block_offsets`):
+  the full per-pixel background at the binned detection resolution
+  (typically the temporal median stack itself), subtracted directly —
+  removes gradients, vignetting AND per-pixel fixed-pattern structure in one
+  pass. Capability flag `HAS_BG_IMAGE = True`.
+
 ## 0.12.0
 
 Robustness across seeing conditions (bloated PSFs, 2-D gradients, trails) for

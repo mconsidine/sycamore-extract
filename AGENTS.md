@@ -52,8 +52,9 @@ Version history (what a fielded wheel might be):
 0.9 matched-filter-only + `top_hat`; 0.10 `block_percentile`/`column`/
 `row_column`; 0.11 `uniform_mean` + `noise_mode="global_rms"`; 0.12
 `kernel_sigma`, `local_noise`, cached `block_offsets`, full 2-D moment trail
-rejection; **0.13 (current)** `bg_image` per-pixel cached background +
-`HAS_BG_IMAGE`.
+rejection; 0.13 `bg_image` per-pixel cached background + `HAS_BG_IMAGE`;
+**0.14 (current)** `detect_stars_roi` window-list ROI detection (one call /
+one GIL release for N tracking windows) + `HAS_ROI`.
 
 ## 3. Build, test, performance gates
 
@@ -91,16 +92,16 @@ replayed offline are the best corpus.
 
 ## 5. Backlog
 
-*(empty as of v0.13.0 — planned items shipped: block cache 0.12, bg_image
-0.13)*
+*(empty as of v0.14.0 — planned items shipped: block cache 0.12, bg_image
+0.13, ROI detection API 0.14)*
 
-Optional future item, take only with diofinder coordination:
-**ROI detection API** — diofinder's tracking mode currently slices numpy
-windows itself and runs the detector per window because there is no native
-ROI entry point. A `detect_stars_roi(image, windows, ...)` that runs the
-matched filter over a window list in one call (one GIL release, one thread
-fan-out) would cut tracking-mode overhead. Additive + capability flag
-(`HAS_ROI`), per §2.
+~~**ROI detection API**~~ — **DONE in v0.14.0.** `detect_stars_roi(image,
+windows, ...)` runs the matched filter over an (N, 4) window list in one call
+(one GIL release, one thread fan-out across the bounded pool), returning at
+most one star per window in full-frame coordinates. Additive + capability
+flag `HAS_ROI`, per §2. diofinder's tracking mode can now probe `HAS_ROI`
+and replace its per-window Python slicing (`tracking.roi_detect`) with a
+single native call.
 
 When you complete or add a task, update this section in the same PR — this
 file is the durable task queue across sessions and agent frameworks.
