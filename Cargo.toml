@@ -1,6 +1,6 @@
 [package]
 name = "star_detect"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 # This crate's 1-D and 2-D star "gate" logic is closely derived from CedarDetect
 # (https://github.com/smroid/cedar-detect) by Steven Rosenthal, which is licensed

@@ -189,6 +189,27 @@ stars = star_detect.detect_stars_with_cache(
     bg_image=med_binned_u8,     # 2-D uint8 (height//bin, width//bin)
 )
 
+# ROI window-list detection (v0.14.0) — the tracking-mode fast path. Detects
+# stars in N small windows of the FULL frame with ONE call: one image copy,
+# one GIL release, windows fanned out across the bounded thread pool (instead
+# of slicing numpy windows in Python and paying one GIL round-trip each).
+# Windows are defensively re-clamped to the image bounds; windows degenerate
+# after clamping (< 8 px on a side) are skipped. bin is always 1 inside a
+# window; background is a per-window per-row median (line_median), noise a
+# whole-window MAD. Probe getattr(star_detect, "HAS_ROI", False) before using.
+stars = star_detect.detect_stars_roi(
+    image_u8,                  # 2-D C-contiguous numpy uint8 (H, W), full frame
+    windows,                   # 2-D numpy int32/int64 (N, 4): x0, y0, x1, y1
+                               # (exclusive), full-frame pixel coords
+    sigma=8.0,
+    kernel_sigma=1.5,
+    local_noise=True,
+    max_axis_ratio=4.0,        # same semantics as detect_stars; default inf
+)
+# -> [(x, y, brightness, peak), ...] brightest-first, FULL-FRAME coordinates
+#    (window offset added back), at most ONE star per window (the brightest
+#    detection in that window), same (0.5, 0.5)-center-of-pixel convention.
+
 # Background-worker helpers (parallel-histogram backed):
 medians = star_detect.compute_row_medians_py(image_u8)        # 1-D per-row median
 grid    = star_detect.compute_block_medians_py(image_u8, 32)  # 2-D per-tile medians
