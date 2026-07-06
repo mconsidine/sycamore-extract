@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.14.1
+
+### Changed
+- **`bg_mode="top_hat"` and the `bg_image` cached path (`detect_stars_with_cache`)
+  now skip the trailing per-row floor scan entirely** (new internal
+  `BgMode::ZeroFloor`). Both already fully flatten the detection image to a
+  near-zero background before the matched-filter gate runs — `top_hat` via
+  `image - opening(image)`, `bg_image` via subtracting the temporal per-pixel
+  median stack directly — so the standard row-percentile floor computed on
+  top of that was pure wasted work (re-measuring ~0), never part of the
+  actual detection math. Verified via multi-seed synthetic A/B (including
+  adversarial fast per-row-oscillation and random per-row-bias scenes) to
+  produce byte-identical detections before and after.
+- Audited the other spatial background modes (`row_column_percentile`,
+  `block_percentile`, `uniform_mean`, and the `block_offsets` cached path)
+  for the same optimization and found it's **not** safe to apply blindly:
+  `uniform_mean` in particular showed real false-negative detections (a
+  genuine star silently dropped) under adversarial per-row bias when its
+  floor was zeroed, because its fixed 25 px window can't resolve per-row
+  structure faster than that scale. Left unchanged; `column_percentile` was
+  never a candidate (it only corrects column-wise offset, so the row floor
+  is load-bearing there). No behavior change for any of these four modes.
+
 ## 0.14.0
 
 ### Added

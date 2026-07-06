@@ -145,10 +145,16 @@ fn generate_matched_kernel(sigma: f64) -> MatchedKernel {
 ///   vertical brightness gradients (vignetting). Equivalent to olive-solve's
 ///   FastBgSubMode::LineMedian. Recommended for frames near twilight, with
 ///   light pollution gradients, or with strong vertical vignetting.
+///
+/// `ZeroFloor`: skip floor estimation entirely (fixed floor of 0). For use
+///   after a spatial preprocessor (e.g. `SpatialBg::TopHat`) has already
+///   flattened the image to a near-zero background — computing a fresh
+///   per-row percentile on top of that would just be re-measuring ~0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BgMode {
     RowPercentile,
     LineMedian,
+    ZeroFloor,
 }
 
 // =========================================================================
@@ -1328,6 +1334,7 @@ fn detect(
     let row_floors: Option<Vec<u8>> = match bg_mode {
         BgMode::LineMedian => Some(compute_row_medians(det_img, det_w, det_h)),
         BgMode::RowPercentile => None,
+        BgMode::ZeroFloor => Some(vec![0u8; det_h]),
     };
 
     // Parallel row-band scan.
@@ -1586,7 +1593,11 @@ fn detect_stars(
             } else {
                 tophat_radius as usize
             };
-            (BgMode::RowPercentile, SpatialBg::TopHat(r))
+            // TopHat already flattens the image to a near-zero background
+            // (image - opening(image)); a fresh per-row percentile floor on
+            // top of that would just be re-measuring ~0. Mirrors the explicit
+            // zero-floor override already used in the cached row-offset path.
+            (BgMode::ZeroFloor, SpatialBg::TopHat(r))
         }
         "column_percentile" | "col_percentile" | "colpercentile" => {
             (BgMode::RowPercentile, SpatialBg::ColPercentile)
@@ -2003,10 +2014,14 @@ fn detect_stars_with_cache(
                 let mut result = if let Some(bg) = &owned_bg {
                     // ---- Full per-pixel cached path. Subtract the temporal
                     // background image directly (gradients, vignetting AND
-                    // fixed-pattern structure in one pass), then run the
-                    // standard detection with the inline RowPercentile floor
-                    // on the near-flat corrected image, exactly like the
-                    // block-grid path. The supplied `noise` is used.
+                    // fixed-pattern structure in one pass). Unlike the
+                    // block-grid path, this model is a per-pixel (not per-tile)
+                    // temporal median, so it resolves row-scale structure the
+                    // block grid can't -- verified (multi-seed synthetic A/B,
+                    // including adversarial per-row bias / fast row oscillation)
+                    // to leave no measurable residual, so the trailing floor
+                    // scan is skipped entirely (BgMode::ZeroFloor) rather than
+                    // re-measuring an already-flat image.
                     let corrected = subtract_image(det_src, bg);
                     detect(
                         &corrected,
@@ -2019,7 +2034,7 @@ fn detect_stars_with_cache(
                         sigma,
                         noise,
                         use_neon,
-                        BgMode::RowPercentile,
+                        BgMode::ZeroFloor,
                         max_axis_ratio,
                         &kernel,
                         local_noise,
