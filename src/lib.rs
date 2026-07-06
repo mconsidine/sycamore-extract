@@ -2014,10 +2014,14 @@ fn detect_stars_with_cache(
                 let mut result = if let Some(bg) = &owned_bg {
                     // ---- Full per-pixel cached path. Subtract the temporal
                     // background image directly (gradients, vignetting AND
-                    // fixed-pattern structure in one pass), then run the
-                    // standard detection with the inline RowPercentile floor
-                    // on the near-flat corrected image, exactly like the
-                    // block-grid path. The supplied `noise` is used.
+                    // fixed-pattern structure in one pass). Unlike the
+                    // block-grid path, this model is a per-pixel (not per-tile)
+                    // temporal median, so it resolves row-scale structure the
+                    // block grid can't -- verified (multi-seed synthetic A/B,
+                    // including adversarial per-row bias / fast row oscillation)
+                    // to leave no measurable residual, so the trailing floor
+                    // scan is skipped entirely (BgMode::ZeroFloor) rather than
+                    // re-measuring an already-flat image.
                     let corrected = subtract_image(det_src, bg);
                     detect(
                         &corrected,
@@ -2030,7 +2034,7 @@ fn detect_stars_with_cache(
                         sigma,
                         noise,
                         use_neon,
-                        BgMode::RowPercentile,
+                        BgMode::ZeroFloor,
                         max_axis_ratio,
                         &kernel,
                         local_noise,
