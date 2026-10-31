@@ -38,7 +38,10 @@ jobs:
           # "manylinux_2_34" tag-rejection issue we hit locally — manylinux2014
           # is universally accepted.
           manylinux: "2014"
-          args: --release --interpreter python${{ matrix.python }}
+          # --locked: build against the committed Cargo.lock and FAIL if it is
+          # missing or stale, so the wheel's numpy/pyo3/transitive crate
+          # versions are frozen and reproducible (see gen-lockfile.yml).
+          args: --release --locked --interpreter python${{ matrix.python }}
           rustup-components: rustfmt
           before-script-linux: |
             # Pin the Cortex-A53 tuning the same way our local .cargo/config.toml
@@ -83,6 +86,15 @@ jobs:
       - name: list wheels
         run: ls -la dist/
 
+      # Publish a SHA-256 next to each wheel so downstream (diofinder) can
+      # hard-verify the wheel it downloads. `sha256sum -c <file>.whl.sha256`
+      # works downstream because the file records just the bare basename.
+      - name: checksums
+        run: |
+          cd dist
+          for w in *.whl; do sha256sum "$w" > "$w.sha256"; done
+          cat *.sha256
+
       # Resolve the tag name: from the pushed tag or from the workflow_dispatch input.
       - name: resolve tag name
         id: tag
@@ -97,7 +109,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          files: dist/*.whl
+          files: |
+            dist/*.whl
+            dist/*.whl.sha256
           body: |
             ## Installation
 
