@@ -1,0 +1,41 @@
+name: gen-lockfile
+
+# Option B helper (diofinder supply-chain pinning): generate Cargo.lock and
+# commit it to the branch this runs on, so the numpy/pyo3/transitive crate
+# versions are frozen and reproducible. star_detect had no committed lockfile,
+# so each build re-resolved `numpy = "0.22"` / `pyo3 = "0.22"` to the latest
+# patch at build time — this closes that drift. Run once on a branch, then
+# merge the branch (lockfile + the build.yml `--locked` change) into main.
+#
+# Dispatch-only; it never runs on push and never touches a release.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gen-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: generate Cargo.lock
+        run: |
+          rustup show || true
+          cargo generate-lockfile
+          echo "--- resolved numpy / pyo3 ---"
+          grep -A1 -E '^name = "(numpy|pyo3)"' Cargo.lock || true
+
+      - name: commit lockfile
+        run: |
+          if git diff --quiet -- Cargo.lock && git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "Cargo.lock already present and unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "build: commit Cargo.lock to freeze numpy/pyo3/transitive deps"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
